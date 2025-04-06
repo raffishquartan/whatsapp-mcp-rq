@@ -483,7 +483,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
             conn.close()
 
 
-def get_last_interaction(jid: str) -> Optional[Message]:
+def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)

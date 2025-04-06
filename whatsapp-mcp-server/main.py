@@ -129,7 +129,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
     return chats
 
 @mcp.tool()
-def get_last_interaction(jid: str) -> Dict[str, Any]:
+def get_last_interaction(jid: str) -> str:
     """Get most recent WhatsApp message involving the contact.
     
     Args:
