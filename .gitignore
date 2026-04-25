@@ -5,3 +5,6 @@ whatsapp.log
 # Per-clone deployed-commit marker. The placeholder value is committed,
 # but the real value differs per machine and must not be pushed.
 INSTALLED_COMMIT_HASH
+
+# Built bridge binary and any local backups (~28MB each, never tracked).
+whatsapp-bridge/whatsapp-bridge*
