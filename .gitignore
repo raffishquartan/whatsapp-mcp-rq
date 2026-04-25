@@ -1,3 +1,7 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+
+# Per-clone deployed-commit marker. The placeholder value is committed,
+# but the real value differs per machine and must not be pushed.
+INSTALLED_COMMIT_HASH
