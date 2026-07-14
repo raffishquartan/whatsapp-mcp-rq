@@ -111,16 +111,6 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         print(f"Error formatting message: {e}")
     return output
 
-def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
-    output = ""
-    if not messages:
-        output += "No messages to display."
-        return output
-    
-    for message in messages:
-        output += format_message(message, show_chat_info)
-    return output
-
 def list_messages(
     after: Optional[str] = None,
     before: Optional[str] = None,
@@ -209,12 +199,11 @@ def list_messages(
                 messages_with_context.extend(context.before)
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
-            
-            return format_messages_list(messages_with_context, show_chat_info=True)
-            
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
-        
+
+            return messages_with_context
+
+        return result
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -329,23 +318,21 @@ def list_chats(
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["""
-            SELECT 
-                chats.jid,
-                chats.name,
-                chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
-            FROM chats
-        """]
-        
+        select_columns = ["chats.jid", "chats.name", "chats.last_message_time"]
+        if include_last_message:
+            select_columns += [
+                "messages.content as last_message",
+                "messages.sender as last_sender",
+                "messages.is_from_me as last_is_from_me",
+            ]
+        query_parts = [f"SELECT {', '.join(select_columns)} FROM chats"]
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
-            
+
         where_clauses = []
         params = []
         
@@ -374,14 +361,14 @@ def list_chats(
                 jid=chat_data[0],
                 name=chat_data[1],
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-                last_message=chat_data[3],
-                last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_message=chat_data[3] if include_last_message else None,
+                last_sender=chat_data[4] if include_last_message else None,
+                last_is_from_me=chat_data[5] if include_last_message else None
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -538,40 +525,38 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        query = """
-            SELECT 
-                c.jid,
-                c.name,
-                c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
-            FROM chats c
-        """
-        
+        select_columns = ["c.jid", "c.name", "c.last_message_time"]
+        if include_last_message:
+            select_columns += [
+                "m.content as last_message",
+                "m.sender as last_sender",
+                "m.is_from_me as last_is_from_me",
+            ]
+        query = f"SELECT {', '.join(select_columns)} FROM chats c"
+
         if include_last_message:
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
+                LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             """
-            
+
         query += " WHERE c.jid = ?"
-        
+
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
         return Chat(
             jid=chat_data[0],
             name=chat_data[1],
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
-            last_message=chat_data[3],
-            last_sender=chat_data[4],
-            last_is_from_me=chat_data[5]
+            last_message=chat_data[3] if include_last_message else None,
+            last_sender=chat_data[4] if include_last_message else None,
+            last_is_from_me=chat_data[5] if include_last_message else None
         )
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return None
