@@ -131,7 +131,7 @@ The project SHALL provide a backfill command that requests history for every cha
 - **THEN** each chat is recorded as "chat not in answer" (not complete, not covered, retried on rerun), the failure streak is neither increased nor reset, and the run continues with the next chat
 
 #### Scenario: Many consecutive chats not in answer stop the run
-- **WHEN** ten consecutive chats end as "chat not in answer" (a processed answer in between resets the count)
+- **WHEN** ten consecutive chats end as "chat not in answer" (any other chat outcome in between, such as a processed answer, a 404 or a failure, resets the count)
 - **THEN** the command stops sending, writes the report naming this reason (not the failure streak) and exits non-zero
 
 #### Scenario: Resume after interruption

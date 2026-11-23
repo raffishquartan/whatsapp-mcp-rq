@@ -81,3 +81,4 @@
 
 - [x] 11.1 Backfill: a 502 `chat_not_in_answer` is recorded per chat but neither increments nor resets the three-failure abort streak; verify with pytest (many such chats do not abort; the streak is unchanged by one)
 - [x] 11.2 Backfill: ten consecutive chats ending as `chat_not_in_answer` stop the run with their own report reason (a processed answer resets the count); verify with pytest for the cap, the reset and the unchanged failure-abort report
+- [x] 11.3 Backfill: the not-in-answer count is genuinely consecutive (any other chat outcome resets it), abort state has a single source of truth with a logged reason, the report wording is consistent, and the rerun behaviour is documented; verify with pytest (interleaved 404, failure, processed answer; abort on the last chat)
