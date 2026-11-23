@@ -173,20 +173,34 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// unwrapMessage removes the ephemeral, view-once, edited and document-with-caption
+// wrappers the same way whatsmeow does before dispatching live message events, so
+// history-sync messages are stored exactly like live ones.
+func unwrapMessage(raw *waProto.Message) *waProto.Message {
+	evt := &events.Message{RawMessage: raw}
+	return evt.UnwrapRaw().Message
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
 	}
 
-	// Try to get text content
-	if text := msg.GetConversation(); text != "" {
-		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	// Text first, then media captions; the first non-empty value wins.
+	// The getters are nil-safe, so no explicit nil checks are needed.
+	candidates := [...]string{
+		msg.GetConversation(),
+		msg.GetExtendedTextMessage().GetText(),
+		msg.GetImageMessage().GetCaption(),
+		msg.GetVideoMessage().GetCaption(),
+		msg.GetDocumentMessage().GetCaption(),
 	}
-
-	// For now, we're ignoring non-text messages
+	for _, text := range candidates {
+		if text != "" {
+			return text
+		}
+	}
 	return ""
 }
 
@@ -1096,24 +1110,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
-
-				// Extract media info
-				var mediaType, filename, url string
-				var mediaKey, fileSHA256, fileEncSHA256 []byte
-				var fileLength uint64
-
-				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
-				}
+				// Unwrap like live events, then extract content and media info
+				unwrapped := unwrapMessage(msg.Message.Message)
+				content := extractTextContent(unwrapped)
+				mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(unwrapped)
 
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
