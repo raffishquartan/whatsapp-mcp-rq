@@ -20,11 +20,11 @@
 ## 4. Verification
 
 - [x] 4.1 `go vet ./...` and `go test ./...` in `whatsapp-bridge` exit 0
-- [ ] 4.2 Rebuild and restart the bridge with the `install-whatsapp-bridge.sh` script in the claude-code-config-sync repository; note the new commit hash
-- [ ] 4.3 Send an image with a caption to a test chat; confirm with a read-only sqlite3 query that the row has the caption and `media_type` = "image", and that the MCP `list_messages` tool returns it
-- [ ] 4.4 Repeat 4.3 for a captioned document and a captioned video
+- [x] 4.2 Rebuild and restart the bridge with the `install-whatsapp-bridge.sh` script in the claude-code-config-sync repository; installed commit 8f51d42
+- [x] 4.3 Send an image with a caption to a test chat; confirm with a read-only sqlite3 query that the row has the caption and `media_type` = "image", and that the MCP `list_messages` tool returns it
+- [x] 4.4 Repeat 4.3 for a captioned document and a captioned video (verified 2026-11-23: image, video and two documents stored with captions, media type, filename, URL and media key; returned by `list_messages`)
 - [x] 4.5 DROPPED on 2026-11-23: no report-back to the claude-code-config-sync project is wanted
 
 ## 5. Specs
 
-- [ ] 5.1 Run `openspec-sync-specs` / `openspec-archive-change` so `message-captions` lands in `openspec/specs/` before shipping
+- [x] 5.1 Run `openspec-sync-specs` / `openspec-archive-change` so `message-captions` lands in `openspec/specs/` before shipping
