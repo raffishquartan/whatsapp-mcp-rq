@@ -6,7 +6,7 @@
 
 ## 2. Migration script
 
-- [x] 2.1 Write `scripts/migrate_timestamps_to_utc.py` per design decision 5 (dry-run default, `--apply`, bridge-running refusal, backup, strict parse, snapshot and hash verification, single transaction, rollback); verify `--help` and a dry-run against a copy of the backup `messages.db.bak-20261123-pre-fixes` report the 1850/6443/3063 and 287/424/6 offset split
+- [x] 2.1 Write `scripts/migrate_timestamps_to_utc.py` per design decision 5 (dry-run default, `--apply`, bridge-running refusal, backup, strict parse, snapshot and hash verification, single transaction, rollback); verify `--help` and a dry-run against a copy of a database backup reports the per-offset row counts
 - [x] 2.2 Add pytest tests with synthetic DBs for: mixed offsets migrate to `+00:00` with instants, counts and min/max unchanged; second run changes zero rows; NULL `last_message_time` preserved; unparseable value aborts with no change; naive value aborts; injected verification failure rolls back; bridge-port-open refusal; backup file created and restorable; run the tests and confirm all pass
 - [x] 2.3 Run `--apply` on a copy of the real backup and verify: all values `+00:00`, `SELECT count(*)` equal before and after, min and max instants equal, second run reports zero changes; record outputs in the session worklog (live DB is not touched in this task)
 

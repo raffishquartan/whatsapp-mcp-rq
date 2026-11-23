@@ -1,11 +1,11 @@
 ## Context
 
-See proposal.md for motivation. Verified facts (2026-11-23, read-only queries on the deployed `messages.db`, 11356 messages, 717 chats):
+See proposal.md for motivation. Verified facts (2026-11-23, read-only queries on a deployed `messages.db`):
 
 - go-sqlite3 v1.14.52 binds a `time.Time` as text using `SQLiteTimestampFormats[0]` (`2006-01-02 15:04:05.999999999-07:00`) in the value's own `Location` (sqlite3.go bind case `time.Time`, ~line 2265). A UTC value renders as `+00:00` (not `Z`, because the layout uses `-07:00`). Whole seconds drop the fractional part, so every stored value is 25 characters (confirmed: all 11356 rows).
 - Reads of `TIMESTAMP` columns try the same formats with `ParseInLocation(..., time.UTC)`, so offsets round-trip; `_loc` only affects reads and is not set in the DSN (`main.go:58`).
 - The bridge produces `time.Unix(ts, 0)` (history sync, `main.go:1086` and `:1153`) and whatsmeow's `Info.Timestamp` (live path, `main.go:422`, `:444`; whatsmeow builds it with `ag.UnixTime("t")`, i.e. `time.Unix`). Both are in `time.Local`, so the stored offset is the host zone's offset at write time.
-- Mixed offsets confirmed. `messages`: `+00:00` 1850 rows, `+01:00` 6443, `+02:00` 3063. `chats.last_message_time`: `+00:00` 287, `+01:00` 424, `+02:00` 6. All `+02:00` rows fall in summer months (2024-07 to 2026-08, mostly 2026-05 to 2026-08), consistent with the host having been on a CEST zone; the cause is not established and is not needed for the fix. Column type is text for every row; no zero-time or NULL messages values.
+- Mixed offsets confirmed: `+00:00`, `+01:00` and `+02:00` all occur in `messages.timestamp` and in `chats.last_message_time`. The cause (the host time zone at write time) is not needed for the fix. Column type is text for every row; no zero-time or NULL messages values.
 - The real bugs are wider than display. The Python server compares and orders timestamps as strings in SQL (`whatsapp.py` `WHERE messages.timestamp > ?`, `ORDER BY messages.timestamp`, and `chats.last_message_time = messages.timestamp` joins). With mixed offsets these are wrong: string order differs from instant order, and the join silently drops the last-message text when the same instant is stored with two offsets. Single-offset UTC storage fixes all of these; Python-side conversion alone would not.
 - `format_message` prints `%Y-%m-%d %H:%M:%S` with no offset, so callers cannot tell which zone a time is in.
 
@@ -52,8 +52,8 @@ Complete write and read site inventory:
 - [Bridge writes during migration] -> bridge-running check plus `BEGIN IMMEDIATE`; the bridge is stopped by hand first.
 - [A row has an unexpected format] -> strict parse aborts before any write; dry-run run first.
 - [WhatsApp history sync later re-delivers old messages] -> `INSERT OR REPLACE` writes them through `StoreMessage`, now UTC, so no regression.
-- [Output change breaks a consumer parsing `YYYY-MM-DD HH:MM:SS`] -> offset appended after seconds; known consumers are Claude sessions reading text. Called out as open question 1 in SUMMARY.
-- [Concurrent proposals edit `main.go` and `whatsapp.py`] -> this change touches only `StoreChat`/`StoreMessage` bodies in Go and the read/format helpers in Python; see SUMMARY for conflict analysis.
+- [Output change breaks a consumer parsing `YYYY-MM-DD HH:MM:SS`] -> offset appended after seconds; known consumers are Claude sessions reading text. The output format is an owner decision; the offset-appended form is the default chosen here.
+- [Concurrent proposals edit `main.go` and `whatsapp.py`] -> this change touches only `StoreChat`/`StoreMessage` bodies in Go and the read/format helpers in Python.
 - [Host `tzdata` missing] -> add `tzdata` dependency; macOS has `/usr/share/zoneinfo`, verified.
 
 ## Migration Plan
@@ -61,11 +61,11 @@ Complete write and read site inventory:
 1. Merge and pull the change; bridge still running the old binary.
 2. Dry-run on a copy: `scripts/migrate_timestamps_to_utc.py --db <copy>`; read the report.
 3. Stop the bridge (`lsof -i :8080`, kill the pid).
-4. `scripts/migrate_timestamps_to_utc.py --db ~/mcp-servers/whatsapp-mcp-rq/whatsapp-bridge/store/messages.db --apply` (writes backup, verifies, commits or rolls back).
-5. Run `~/repos/claude-code-config-sync/scripts/install-whatsapp-bridge.sh` (pulls, builds, restarts the bridge with the UTC-writing binary).
+4. `scripts/migrate_timestamps_to_utc.py --db <bridge-dir>/store/messages.db --apply` (writes backup, verifies, commits or rolls back).
+5. Run the bridge install script (pulls, builds, restarts the bridge with the UTC-writing binary).
 6. Restart the MCP server (new Claude session) and check: `list_messages` over a BST date and a GMT date match WhatsApp Web; `SELECT DISTINCT substr(timestamp,-6) FROM messages` returns only `+00:00`; send or receive one message and re-check.
 Rollback: stop the bridge, copy the backup over `messages.db`, reinstall the previous commit via the install script with `--no-pull` after checking out the previous commit, restart.
 
 ## Open Questions
 
-- None that block the specs; presentation format and DB-level guard are listed with options in SUMMARY.md.
+- None that block the specs; the presentation format (offset appended) and the DB-level guard (none) are decided in this design.

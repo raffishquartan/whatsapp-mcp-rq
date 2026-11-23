@@ -243,7 +243,10 @@ def run_migration(
             reports.append(ColumnReport(col, befores[col], after, changes[col]))
         matching_after = chats_matching_last_message(conn)
     except BaseException:
-        conn.execute("ROLLBACK")
+        # SQLite may already have rolled back (for example on a full disk); a second
+        # ROLLBACK would raise and hide the original error.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
     conn.execute("COMMIT" if commit else "ROLLBACK")
     return tuple(reports), matching_before, matching_after
@@ -259,6 +262,10 @@ def write_backup(conn: sqlite3.Connection, target: Path) -> None:
     dest = sqlite3.connect(target)
     try:
         conn.backup(dest)
+    except sqlite3.Error:
+        dest.close()
+        target.unlink(missing_ok=True)
+        raise
     finally:
         dest.close()
 
@@ -350,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
             bridge_host=args.bridge_host,
             bridge_port=args.bridge_port,
         )
-    except MigrationError as e:
+    except (MigrationError, sqlite3.Error) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     for line in format_report(report):

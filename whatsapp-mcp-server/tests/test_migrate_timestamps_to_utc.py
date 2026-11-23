@@ -212,6 +212,49 @@ def test_verification_failure_rolls_back(mixed_db: Path, closed_port: int) -> No
     assert dump(mixed_db) == before
 
 
+def test_verification_failure_on_non_canonical_value_rolls_back(mixed_db: Path, closed_port: int) -> None:
+    before = dump(mixed_db)
+
+    def restore_offset(conn: sqlite3.Connection) -> None:
+        # Same instant as the migrated value, so counts, min/max and the hash still match.
+        conn.execute("UPDATE messages SET timestamp = '2026-07-03 10:49:42+01:00' WHERE id = 'm2'")
+
+    with pytest.raises(mig.MigrationError, match="non-canonical value remains"):
+        apply(mixed_db, closed_port, after_update=restore_offset)
+    assert dump(mixed_db) == before
+
+
+def test_original_error_survives_when_sqlite_already_rolled_back(mixed_db: Path, closed_port: int) -> None:
+    def rolled_back_then_fail(conn: sqlite3.Connection) -> None:
+        conn.execute("ROLLBACK")
+        raise mig.MigrationError("original failure")
+
+    with pytest.raises(mig.MigrationError, match="original failure"):
+        apply(mixed_db, closed_port, after_update=rolled_back_then_fail)
+
+
+def test_sqlite_error_exits_non_zero_with_message(tmp_path: Path, closed_port: int, capsys: pytest.CaptureFixture[str]) -> None:
+    not_a_db = tmp_path / "messages.db"
+    not_a_db.write_text("this is not a database")
+    code = mig.main(["--db", str(not_a_db), "--apply", "--no-backup", "--bridge-host", "127.0.0.1",
+                     "--bridge-port", str(closed_port)])
+    assert code == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_failed_backup_leaves_no_partial_file(tmp_path: Path) -> None:
+    class FailingSource:
+        def backup(self, dest: sqlite3.Connection) -> None:
+            dest.execute("CREATE TABLE partial (x)")
+            dest.commit()
+            raise sqlite3.OperationalError("database or disk is full")
+
+    target = tmp_path / "messages.db.bak-test"
+    with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+        mig.write_backup(FailingSource(), target)  # type: ignore[arg-type]
+    assert not target.exists()
+
+
 def test_verification_failure_on_row_count_rolls_back(mixed_db: Path, closed_port: int) -> None:
     before = dump(mixed_db)
 
