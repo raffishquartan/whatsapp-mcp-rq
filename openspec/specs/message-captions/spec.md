@@ -1,7 +1,7 @@
 # message-captions Specification
 
 ## Purpose
-TBD - created by archiving change caption-extraction. Update Purpose after archive.
+Store the caption of image, video and document messages as the message's text in the bridge database, identically for live messages and history sync, so captions are listed and searchable through the MCP server.
 
 ## Requirements
 
