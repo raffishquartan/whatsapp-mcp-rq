@@ -207,7 +207,7 @@ Errors return `{"success": false, "message": "..."}` and send nothing to WhatsAp
 | 503 | Bridge not connected or not logged in |
 | 504 | No answer within 60 seconds (body includes `request_id`); a late answer is still stored |
 
-For a `@lid` chat the bridge looks up the chat's phone-number JID in its LID store and sends the request with that JID, anchored on the LID chat's stored message; without a known phone number it sends the LID.
+For a `@lid` chat the bridge looks up the chat's phone-number JID in its LID store and sends the request with that JID, anchored on the LID chat's stored message; the answer is stored under the LID chat. Without a known phone number it sends the LID.
 
 Example:
 
