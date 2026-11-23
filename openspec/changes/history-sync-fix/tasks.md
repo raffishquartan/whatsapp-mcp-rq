@@ -80,3 +80,4 @@
 ## 11. Owner decision: chat-not-in-answer does not abort
 
 - [x] 11.1 Backfill: a 502 `chat_not_in_answer` is recorded per chat but neither increments nor resets the three-failure abort streak; verify with pytest (many such chats do not abort; the streak is unchanged by one)
+- [x] 11.2 Backfill: ten consecutive chats ending as `chat_not_in_answer` stop the run with their own report reason (a processed answer resets the count); verify with pytest for the cap, the reset and the unchanged failure-abort report
