@@ -5,7 +5,7 @@
 ## 1. Spike (time-boxed: 2 hours, 3 attempts over at least 2 days - design.md Decision 9)
 
 - [ ] 1.1 On a throwaway branch, add a minimal unauthenticated loopback route that builds `types.MessageInfo` from the oldest stored message of the canary group (`<canary-group-jid>`), calls `client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(&info, 50))`, logs the `SendResponse.ID`, and in `handleHistorySync` logs `Data.GetSyncType()`, `Notification.GetOriginalMessageID()`, `Notification.GetPeerDataRequestSessionID()` and conversation IDs; verify by building with `go build ./...`
-- [ ] 1.2 Run the spike build locally against the real account (phone online), call the route for the canary group, one `@lid` direct chat and one other group; record in the session WORKLOG which correlation field is filled, whether LID chats answer, what a start-of-chat answer looks like (empty conversation for the chat, or no conversation at all), and whether any message from the canary group's known gap arrived
+- [ ] 1.2 Run the spike build locally against the real account (phone online), call the route for the canary group, one `@lid` direct chat and one other group; record in the session WORKLOG which correlation field is filled, whether LID chats answer, what a start-of-chat answer looks like (empty conversation for the chat, or no conversation at all), and whether any message from the canary chat's suspected gap arrived
 - [ ] 1.3 Apply the Decision 9 outcome: proceed, ship as best effort, or stop and ask the owner before deleting; record the outcome in the WORKLOG; discard the spike branch
 
 ## 2. Store layer (Go)
@@ -49,7 +49,7 @@
 ## 8. Deployment and acceptance (after merge)
 
 - [ ] 8.1 Run the owner's bridge install script; verify `INSTALLED_COMMIT_HASH` matches the merge commit and a POST with an empty body returns 400
-- [ ] 8.2 Back up `messages.db`, then run the canary `whatsapp-history-backfill --only <canary-group-jid> --since <date before the gap> --out <working-dir>/backfill-canary`; verify the report shows new messages from the known gap, or record evidence that they cannot be retrieved
+- [ ] 8.2 Back up `messages.db`, then run the canary `whatsapp-history-backfill --only <canary-group-jid> --since <date before the gap> --out <working-dir>/backfill-canary`; verify the report shows new messages from the suspected gap, or record evidence that they cannot be retrieved
 - [ ] 8.3 Search for recent ban reports, then `whatsapp-history-backfill --since <window-start> --canary <canary-group-jid> --out <working-dir>/backfill`; verify the report lists every non-broadcast chat in the window (count from `--dry-run`), each with stop reason "reached since" or "start of chat", and share the summary with the owner
 - [ ] 8.4 Hand the outcome and the new invocation (POST endpoint or backfill command) to the owner's downstream workflow; verify the handoff was sent
 
@@ -63,3 +63,16 @@
 - [x] 9.6 Backfill: new stop reasons "no stored message in answer" and "chat not in answer" (not complete, not covered); page cap and budget resume from the recorded anchor with counts carried across runs; verify with pytest for each, plus 409 with the budget exhausted and a corrupt progress file exiting 2
 - [x] 9.7 Backfill `--db`: show the resolved default in `--help`, name `--db` in the missing-database error, document in README; verify with pytest
 - [x] 9.8 README: `next_before_message_id` null semantics, 502 `chat_not_in_answer`, resume rules; change docs generalised to omit facts about the private message store
+
+## 10. Second review fixes (PR #12)
+
+- [x] 10.1 Bridge: own history messages use the key's participant when set (own LID user in LID-addressed groups), falling back to the own phone-number user; verify with a Go test
+- [x] 10.2 Bridge: the 502 `chat_not_in_answer` body carries a `conversations` JSON array (empty when none); verify with Go tests for a populated and an empty list
+- [x] 10.3 Bridge: delete `MessageStore.NewestMessage` (no production caller) and its test assertions
+- [x] 10.4 Bridge: bound `SendPeerMessage` by a 30-second send timeout so a request takes at most 90 seconds (send plus 60-second wait); backfill HTTP timeout = that maximum + 30-second margin; verify with a Go test of a blocked send and a pytest that reads the Go constants
+- [x] 10.5 Backfill: stop a chat with "no progress" (a failure; not complete, not covered) when the next anchor was already requested for it in the run; verify with pytest for the same anchor, a cycle, the rerun and the abort
+- [x] 10.6 Backfill: neutralise formula-leading cells in `report.csv`; verify with pytest
+- [x] 10.7 Backfill: validate every progress-file field's type and exit 2 on a bad one; verify with pytest for each corrupt shape
+- [x] 10.8 Backfill: warn about and report `--only` chats with no stored message in the window; verify with pytest
+- [x] 10.9 Backfill: annotate all module-level constants; verify with a pytest and `mypy --strict`
+- [x] 10.10 Docs: neutral wording for the private message store in design.md; generic `--since` example in README

@@ -57,16 +57,20 @@ The endpoint SHALL report bridge state and send failures as structured errors an
 - **WHEN** sending the peer message returns an error
 - **THEN** the bridge responds 502 with the error text
 
+#### Scenario: Send does not complete in time
+- **WHEN** sending the peer message has not completed within the send timeout (30 seconds)
+- **THEN** the bridge abandons the send and responds 502 with the error text, so one request takes at most 90 seconds (30-second send plus 60-second wait) after the anchor lookup
+
 #### Scenario: Answer without the requested chat
 - **WHEN** the on-demand history sync that matches the request id holds no conversation for `chat_jid` (for example the phone answered under another JID for the chat)
-- **THEN** the bridge stores what the answer holds and responds 502 with `reason: "chat_not_in_answer"`, the `request_id`, and the conversation JIDs the answer held; it does not report the start of the chat
+- **THEN** the bridge stores what the answer holds and responds 502 with `reason: "chat_not_in_answer"`, the `request_id`, and a `conversations` JSON array of the conversation JIDs the answer held (empty when it held none); it does not report the start of the chat
 
 #### Scenario: Late answer to an earlier request
 - **WHEN** an on-demand history sync carrying another request's original message id arrives while a request is pending, including while that request is still being sent
 - **THEN** the bridge stores it and does not complete the pending request with it
 
 #### Scenario: Phone does not answer in time
-- **WHEN** no matching on-demand history sync arrives within the wait timeout (default 60 seconds)
+- **WHEN** no matching on-demand history sync arrives within the wait timeout (60 seconds, counted from when the send returns)
 - **THEN** the bridge responds 504 with the request id, and still stores the answer if it arrives later
 
 ### Requirement: Result reporting
@@ -99,12 +103,16 @@ Storing messages from any history sync SHALL be idempotent on (`id`, `chat_jid`)
 - **WHEN** a history-sync message from a group participant (a phone-number or LID JID, possibly with a device) is stored
 - **THEN** `messages.sender` holds the participant's user part, as the live message handler stores it
 
+#### Scenario: Own message sender matches live messages
+- **WHEN** a history-sync message sent by this account is stored
+- **THEN** `messages.sender` holds the participant's user part when the message key carries a participant (this account's LID user in a LID-addressed group, as the live handler stores it), and this account's phone-number user otherwise
+
 #### Scenario: Concurrent live and history writes
 - **WHEN** live messages and history-sync messages are stored at the same time
 - **THEN** no write fails because the database is locked
 
 ### Requirement: Bulk backfill procedure
-The project SHALL provide a backfill command that requests history for every chat with at least one stored message on or after a given `--since` date (UTC), excluding broadcast chats, reading `messages.db` read-only for its chat list and its before/after counts. For each chat it SHALL page backwards from the newest stored message until the answer's oldest message is older than `--since`, the answer for the chat is empty (start of chat), or a per-chat page cap is hit. An answer that cannot be paged from (messages but no stored anchor) or that does not hold the chat SHALL stop the chat without marking it complete.
+The project SHALL provide a backfill command that requests history for every chat with at least one stored message on or after a given `--since` date (UTC), excluding broadcast chats, reading `messages.db` read-only for its chat list and its before/after counts. For each chat it SHALL page backwards from the newest stored message until the answer's oldest message is older than `--since`, the answer for the chat is empty (start of chat), or a per-chat page cap is hit. An answer that cannot be paged from (messages but no stored anchor), that does not hold the chat, or whose next anchor was already requested for the chat in the run SHALL stop the chat without marking it complete. The command's HTTP timeout SHALL exceed the bridge's 90-second maximum per request by a fixed margin, so it never abandons a request the bridge is still serving. Its CSV report SHALL neutralise cells that a spreadsheet would read as formulas.
 
 #### Scenario: Full run
 - **WHEN** the owner runs the command with `--since <date>` and every request succeeds
@@ -125,6 +133,18 @@ The project SHALL provide a backfill command that requests history for every cha
 #### Scenario: Inconclusive answer
 - **WHEN** an answer has `received` greater than 0 and `next_before_message_id: null`, or the bridge responds 502 with `reason: "chat_not_in_answer"`
 - **THEN** the chat is listed as not reaching `--since` with its own stop reason (never "start of chat"), and a rerun requests it again
+
+#### Scenario: No progress
+- **WHEN** an answer has `received` greater than 0, does not reach `--since`, and its `next_before_message_id` is an anchor already requested for the chat in this run (including the anchor just requested)
+- **THEN** the chat stops with the reason "no progress" without sending the repeated request, the stop counts as a failure towards the error-streak abort, the chat is listed as not reaching `--since` (never "start of chat"), and a rerun requests it again from its last anchor
+
+#### Scenario: Selected chat with no messages in the window
+- **WHEN** a chat given with `--only` has no stored message on or after `--since`
+- **THEN** the command logs a warning naming it, does not request it, and lists it in the report summary
+
+#### Scenario: Corrupt progress file
+- **WHEN** the progress file is not valid JSON, lacks a field, or has a field of the wrong type (for example a count that is not a non-negative integer, or an unknown stop reason)
+- **THEN** the command sends nothing and exits 2 with an error naming the progress file
 
 #### Scenario: Page cap raised on rerun
 - **WHEN** a chat stopped at the page cap and the command is rerun with a higher `--max-pages-per-chat`

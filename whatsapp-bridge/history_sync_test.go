@@ -131,8 +131,6 @@ func TestAnchorLookups(t *testing.T) {
 	}
 	a, err := store.OldestMessage("chat@g.us")
 	check("OldestMessage", a, err, "old", true, 1700000100)
-	a, err = store.NewestMessage("chat@g.us")
-	check("NewestMessage", a, err, "new", false, 1700000300)
 	a, err = store.MessageByID("mid", "chat@g.us")
 	check("MessageByID", a, err, "mid", false, 1700000200)
 }
@@ -143,9 +141,6 @@ func TestAnchorLookupsNotFound(t *testing.T) {
 
 	if _, err := store.OldestMessage("empty@g.us"); !errors.Is(err, errNoStoredMessage) {
 		t.Errorf("OldestMessage err = %v, want errNoStoredMessage", err)
-	}
-	if _, err := store.NewestMessage("empty@g.us"); !errors.Is(err, errNoStoredMessage) {
-		t.Errorf("NewestMessage err = %v, want errNoStoredMessage", err)
 	}
 	if _, err := store.MessageByID("missing", "chat@g.us"); !errors.Is(err, errNoStoredMessage) {
 		t.Errorf("MessageByID err = %v, want errNoStoredMessage", err)
@@ -347,6 +342,9 @@ type fakeSender struct {
 	loggedIn  bool
 	sendErr   error
 	respID    string
+	// blockSend makes SendPeerMessage wait for its context to end, like a send whose
+	// server acknowledgement never arrives.
+	blockSend bool
 
 	mu     sync.Mutex
 	sent   []*waE2E.Message
@@ -365,11 +363,15 @@ func (f *fakeSender) BuildHistorySyncRequest(info *types.MessageInfo, count int)
 	return (&whatsmeow.Client{}).BuildHistorySyncRequest(info, count)
 }
 
-func (f *fakeSender) SendPeerMessage(_ context.Context, msg *waE2E.Message) (whatsmeow.SendResponse, error) {
+func (f *fakeSender) SendPeerMessage(ctx context.Context, msg *waE2E.Message) (whatsmeow.SendResponse, error) {
 	f.mu.Lock()
 	f.sent = append(f.sent, msg)
 	f.mu.Unlock()
 	f.sentCh <- struct{}{}
+	if f.blockSend {
+		<-ctx.Done()
+		return whatsmeow.SendResponse{}, ctx.Err()
+	}
 	if f.sendErr != nil {
 		return whatsmeow.SendResponse{}, f.sendErr
 	}
@@ -401,10 +403,15 @@ type historyFixture struct {
 	handler http.Handler
 }
 
-func newHistoryFixture(t *testing.T, timeout time.Duration) *historyFixture {
+func newHistoryFixture(t *testing.T, waitTimeout time.Duration) *historyFixture {
+	t.Helper()
+	return newHistoryFixtureWithSendTimeout(t, historySyncSendTimeout, waitTimeout)
+}
+
+func newHistoryFixtureWithSendTimeout(t *testing.T, sendTimeout, waitTimeout time.Duration) *historyFixture {
 	t.Helper()
 	f := &historyFixture{sender: newFakeSender(), store: newTestStore(t), reg: &historyRequestRegistry{}}
-	f.handler = newHistorySyncHandler(f.sender, f.store, f.reg, timeout)
+	f.handler = newHistorySyncHandler(f.sender, f.store, f.reg, sendTimeout, waitTimeout)
 	return f
 }
 
@@ -547,6 +554,23 @@ func TestHistoryEndpointSendFailure(t *testing.T) {
 	expectError(t, f.do(http.MethodPost, `{"chat_jid":"chat@g.us"}`), http.StatusBadGateway, "server said no")
 	if _, ok := f.reg.begin("chat@g.us"); !ok {
 		t.Error("registry still busy after send failure")
+	}
+}
+
+func TestHistoryEndpointSendTimeoutBoundsTheSend(t *testing.T) {
+	f := newHistoryFixtureWithSendTimeout(t, 20*time.Millisecond, 5*time.Second)
+	storeText(t, f.store, "m1", time.Unix(1700000100, 0), false)
+	f.sender.blockSend = true
+	expectError(t, f.do(http.MethodPost, `{"chat_jid":"chat@g.us"}`), http.StatusBadGateway, context.DeadlineExceeded.Error())
+	if _, ok := f.reg.begin("chat@g.us"); !ok {
+		t.Error("registry still busy after send timeout")
+	}
+}
+
+func TestHistorySyncMaxDurationIsSendPlusWait(t *testing.T) {
+	// README and the backfill client's HTTP timeout rely on this documented bound.
+	if historySyncMaxDuration != 90*time.Second || historySyncSendTimeout+historySyncWaitTimeout != historySyncMaxDuration {
+		t.Errorf("send %s + wait %s, max %s; want 30s + 60s = 90s", historySyncSendTimeout, historySyncWaitTimeout, historySyncMaxDuration)
 	}
 }
 
@@ -723,6 +747,26 @@ func TestStoreHistorySyncSenderMatchesLiveRepresentation(t *testing.T) {
 	}
 }
 
+func TestStoreHistorySyncOwnMessageSenderMatchesLiveRepresentation(t *testing.T) {
+	store := newTestStore(t)
+	ownWithParticipant := func(id, participant string) *waHistorySync.HistorySyncMsg {
+		m := historyMsg(id, 1700000100, true, textMsg(id))
+		m.Message.Key.Participant = proto.String(participant)
+		return m
+	}
+	storeSync(store, historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "",
+		conversation("lidgroup@g.us", ownWithParticipant("own-lid", "444:3@lid")),
+		conversation("pngroup@g.us", ownWithParticipant("own-pn", "555@s.whatsapp.net")),
+		conversation("333@s.whatsapp.net", historyMsg("own-dm", 1700000100, true, textMsg("own-dm")))))
+	// Live group messages store the participant attribute's user (the own LID user in a
+	// LID-addressed group); without a participant the own phone user is the only value known.
+	for id, want := range map[string]string{"own-lid": "444", "own-pn": "555", "own-dm": "own"} {
+		if got := rawText(t, store, "SELECT sender FROM messages WHERE id = ?", id); got != want {
+			t.Errorf("sender of %s = %q, want %q", id, got, want)
+		}
+	}
+}
+
 func TestSenderIDIsUserPart(t *testing.T) {
 	if got := senderID(types.NewJID("111", types.DefaultUserServer)); got != "111" {
 		t.Errorf("senderID = %q, want 111", got)
@@ -817,8 +861,24 @@ func TestHistoryEndpointAnswerWithoutChatConversation(t *testing.T) {
 	if body["reason"] != historyReasonChatNotInAnswer || body["request_id"] != "REQ1" {
 		t.Errorf("body = %v, want reason %s and request_id REQ1", body, historyReasonChatNotInAnswer)
 	}
+	if convs, _ := body["conversations"].([]any); len(convs) != 1 || convs[0] != "other@g.us" {
+		t.Errorf("conversations = %v, want [other@g.us]", body["conversations"])
+	}
 	if _, ok := f.reg.begin("chat@g.us"); !ok {
 		t.Error("registry still busy")
+	}
+}
+
+func TestHistoryEndpointAnswerWithNoConversationsListsEmptyArray(t *testing.T) {
+	f := newHistoryFixture(t, 5*time.Second)
+	storeText(t, f.store, "m1", time.Unix(1700000100, 0), false)
+	pending := f.doAsync(`{"chat_jid":"chat@g.us"}`)
+	f.sender.waitSent(t)
+	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1"))
+
+	body := expectError(t, waitResponse(t, pending), http.StatusBadGateway, "chat@g.us")
+	if convs, ok := body["conversations"].([]any); !ok || len(convs) != 0 {
+		t.Errorf("conversations = %#v, want empty array", body["conversations"])
 	}
 }
 

@@ -12,6 +12,7 @@ Safety (each request is a peer message to the user's own phone):
 - one request at a time, at least `--delay` seconds plus 0-5 seconds of random
   jitter between requests, and a hard `--budget` on the number of requests;
 - the run stops after 3 consecutive failed requests (404 is not a failure);
+- a chat stops ("no progress") rather than send a request it already sent in the run;
 - `messages.db` is opened read-only; only the bridge writes to it;
 - progress is saved after each chat, so a rerun skips completed chats and resumes
   the others from the anchor they stopped at.
@@ -39,18 +40,27 @@ from whatsapp import DB_TIMESTAMP_FORMAT, MESSAGES_DB_PATH, WHATSAPP_API_BASE_UR
 
 logger = logging.getLogger(__name__)
 
-PAGE_SIZE = 50
-DEFAULT_DELAY_SECONDS = 10.0
-JITTER_MAX_SECONDS = 5.0
-DEFAULT_BUDGET = 150
-DEFAULT_MAX_PAGES_PER_CHAT = 10
-MAX_FAILURE_STREAK = 3
-CHAT_NOT_IN_ANSWER_REASON = "chat_not_in_answer"
-# The bridge waits up to 60 seconds for the phone; allow for that plus overhead.
-HTTP_TIMEOUT_SECONDS = 90.0
-JID_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+$")
-BROADCAST_SUFFIX = "@broadcast"
-GROUP_SUFFIX = "@g.us"
+PAGE_SIZE: int = 50
+DEFAULT_DELAY_SECONDS: float = 10.0
+JITTER_MAX_SECONDS: float = 5.0
+DEFAULT_BUDGET: int = 150
+DEFAULT_MAX_PAGES_PER_CHAT: int = 10
+MAX_FAILURE_STREAK: int = 3
+CHAT_NOT_IN_ANSWER_REASON: str = "chat_not_in_answer"
+# Longest the bridge spends on one request after its anchor lookup: up to 30 s sending
+# the peer request plus up to 60 s waiting for the phone's answer (historySyncSendTimeout
+# + historySyncWaitTimeout = historySyncMaxDuration in whatsapp-bridge/main.go; a test
+# checks the two stay equal). The HTTP timeout adds a margin for the local round trip and
+# the bridge's database writes, so a slow bridge request is never abandoned while the
+# bridge is still working on it (which would make the next request a spurious 409).
+BRIDGE_MAX_REQUEST_SECONDS: float = 90.0
+HTTP_TIMEOUT_MARGIN_SECONDS: float = 30.0
+HTTP_TIMEOUT_SECONDS: float = BRIDGE_MAX_REQUEST_SECONDS + HTTP_TIMEOUT_MARGIN_SECONDS
+JID_PATTERN: re.Pattern[str] = re.compile(r"^[^@\s]+@[^@\s]+$")
+BROADCAST_SUFFIX: str = "@broadcast"
+GROUP_SUFFIX: str = "@g.us"
+# A CSV cell starting with one of these is read as a formula by spreadsheet applications.
+CSV_FORMULA_PREFIXES: tuple[str, ...] = ("=", "+", "-", "@", "\t", "\r")
 
 
 class BackfillError(Exception):
@@ -74,15 +84,19 @@ class StopReason(enum.Enum):
     UNANCHORED_ANSWER = "no stored message in answer"
     # The answer to the request held no conversation for the chat (bridge 502, reason chat_not_in_answer).
     CHAT_NOT_IN_ANSWER = "chat not in answer"
+    # The answer's next anchor is one already requested for the chat in this run, so the
+    # next request would repeat an earlier one.
+    NO_PROGRESS = "no progress"
     BUDGET = "budget exhausted"
     FAILED = "failed"
 
 
 # A chat with one of these stop reasons is not requested again on a rerun. Every other
 # chat is resumed from its ChatResult.next_anchor.
-COMPLETE_REASONS = frozenset({StopReason.REACHED_SINCE, StopReason.START_OF_CHAT, StopReason.NO_ANCHOR})
+COMPLETE_REASONS: frozenset[StopReason] = frozenset(
+    {StopReason.REACHED_SINCE, StopReason.START_OF_CHAT, StopReason.NO_ANCHOR})
 # A chat with one of these stop reasons is known to be complete back to --since.
-COVERED_REASONS = frozenset({StopReason.REACHED_SINCE, StopReason.START_OF_CHAT})
+COVERED_REASONS: frozenset[StopReason] = frozenset({StopReason.REACHED_SINCE, StopReason.START_OF_CHAT})
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Request older history from the primary phone for every chat active since a date, "
         "and report what was added to messages.db.",
     )
-    parser.add_argument("--since", required=True, type=_since_date, help="window start, ISO date (UTC), e.g. 2026-11-01")
+    parser.add_argument("--since", required=True, type=_since_date, help="window start, ISO date (UTC), e.g. 2026-01-01")
     parser.add_argument("--out", required=True, type=Path, help="directory for report.md, report.csv and progress.json")
     parser.add_argument("--db", type=Path, default=Path(MESSAGES_DB_PATH).resolve(),
                         help="messages.db path, opened read-only (default: %(default)s, the bridge store next to "
@@ -291,7 +305,14 @@ def select_chats(config: Config) -> list[ChatSnapshot]:
         raise BackfillError(f"no chats with stored messages since {config.since.date().isoformat()} match the selection")
     if config.canary is not None and config.canary not in snapshots:
         logger.warning("canary %s has no stored messages in the window; it is not processed", config.canary)
+    for jid in unmatched_only(config, snapshots):
+        logger.warning("--only %s has no stored messages in the window; it is not processed", jid)
     return order_chats(list(snapshots.values()), config.canary)
+
+
+def unmatched_only(config: Config, selected: Mapping[str, object]) -> list[str]:
+    """The --only JIDs, in the order given, with no stored message in the window."""
+    return [jid for jid in dict.fromkeys(config.only) if jid not in selected]
 
 
 # --- bridge ---
@@ -404,6 +425,7 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
     from where the previous run stopped. Page and request counts are totals across runs,
     so --max-pages-per-chat caps the chat as a whole."""
     progress = _ChatProgress(chat.newest_id) if previous is None else _ChatProgress.resume(previous)
+    requested: set[str] = set()
 
     def fail(message: str, stop: StopReason = StopReason.FAILED) -> ChatResult:
         progress.errors.append(message)
@@ -416,6 +438,7 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
         if progress.pages >= config.max_pages_per_chat:
             return progress.result(chat.jid, StopReason.PAGE_CAP)
         body: dict[str, object] = {"chat_jid": chat.jid, "count": PAGE_SIZE, "before_message_id": progress.anchor}
+        requested.add(progress.anchor)
         if state.requests_sent >= config.budget:
             state.budget_exhausted = True
             return progress.result(chat.jid, StopReason.BUDGET)
@@ -439,14 +462,20 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
         except MalformedResponse as exc:
             return fail(str(exc))
 
-        state.failure_streak = 0
         progress.pages += 1
         progress.received += page.received
         progress.stored_new += page.stored_new
         progress.stored_existing += page.stored_existing
         logger.info("%s page %d: received %d, new %d, oldest %s", chat.jid, progress.pages, page.received,
                     page.stored_new, page.oldest_timestamp)
-        if page.oldest_timestamp is not None and page.oldest_timestamp < config.since:
+        reached_since = page.oldest_timestamp is not None and page.oldest_timestamp < config.since
+        if not reached_since and page.received > 0 and page.next_before_message_id in requested:
+            # Following this anchor would repeat a request. It counts as a failure, so
+            # repeated no-progress chats abort the run rather than each sending more requests.
+            return fail(f"no progress: next anchor {page.next_before_message_id} "
+                        "was already requested for this chat", StopReason.NO_PROGRESS)
+        state.failure_streak = 0
+        if reached_since:
             return progress.result(chat.jid, StopReason.REACHED_SINCE)
         if page.received == 0:
             return progress.result(chat.jid, StopReason.START_OF_CHAT)
@@ -467,21 +496,69 @@ class _Progress:
     results: dict[str, ChatResult]
 
 
+class _BadProgress(Exception):
+    """A progress file field is missing or has the wrong type."""
+
+
+def _obj(value: object, where: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise _BadProgress(f"{where} is not an object")
+    return {str(k): v for k, v in value.items()}
+
+
+def _str(obj: Mapping[str, object], key: str, where: str) -> str:
+    value = obj.get(key)
+    if not isinstance(value, str):
+        raise _BadProgress(f"{where}.{key} = {value!r} is not a string")
+    return value
+
+
+def _count(obj: Mapping[str, object], key: str, where: str) -> int:
+    value = obj.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise _BadProgress(f"{where}.{key} = {value!r} is not a non-negative integer")
+    return value
+
+
+def _snapshot_from_json(jid: str, value: object) -> ChatSnapshot:
+    where = f"before[{jid}]"
+    s = _obj(value, where)
+    messages = _obj(s.get("messages"), f"{where}.messages")
+    typed_messages = {mid: _str(messages, mid, f"{where}.messages") for mid in messages}
+    newest_id = _str(s, "newest_id", where)
+    if newest_id not in typed_messages:
+        raise _BadProgress(f"{where}.newest_id {newest_id!r} is not in its messages")
+    return ChatSnapshot(jid, _str(s, "name", where), typed_messages, newest_id, _str(s, "newest_timestamp", where))
+
+
+def _result_from_json(jid: str, value: object) -> ChatResult:
+    where = f"chats[{jid}]"
+    r = _obj(value, where)
+    try:
+        stop = StopReason(_str(r, "stop", where))
+    except ValueError:
+        raise _BadProgress(f"{where}.stop = {r.get('stop')!r} is not a stop reason") from None
+    errors = r.get("errors")
+    if not isinstance(errors, list) or not all(isinstance(e, str) for e in errors):
+        raise _BadProgress(f"{where}.errors = {errors!r} is not a list of strings")
+    return ChatResult(jid, stop, _count(r, "requests", where), _count(r, "pages", where),
+                      _count(r, "received", where), _count(r, "stored_new", where),
+                      _count(r, "stored_existing", where), tuple(errors), _str(r, "next_anchor", where))
+
+
 def _load_progress(config: Config) -> _Progress:
     since = config.since.date().isoformat()
     if not config.progress.exists():
         return _Progress(since, {}, {})
     try:
-        raw = json.loads(config.progress.read_text())
-        if raw["since"] != since:
-            raise BackfillError(f"progress file {config.progress} is for since {raw['since']}, not {since}; "
+        raw = _obj(json.loads(config.progress.read_text()), "progress")
+        raw_since = _str(raw, "since", "progress")
+        if raw_since != since:
+            raise BackfillError(f"progress file {config.progress} is for since {raw_since}, not {since}; "
                                 "use another --progress or --out")
-        before = {jid: ChatSnapshot(jid, s["name"], s["messages"], s["newest_id"], s["newest_timestamp"])
-                  for jid, s in raw["before"].items()}
-        results = {jid: ChatResult(jid, StopReason(r["stop"]), r["requests"], r["pages"], r["received"],
-                                   r["stored_new"], r["stored_existing"], tuple(r["errors"]), r["next_anchor"])
-                   for jid, r in raw["chats"].items()}
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        before = {jid: _snapshot_from_json(jid, s) for jid, s in _obj(raw.get("before"), "before").items()}
+        results = {jid: _result_from_json(jid, r) for jid, r in _obj(raw.get("chats"), "chats").items()}
+    except (OSError, ValueError, _BadProgress) as exc:
         raise BackfillError(f"cannot read progress file {config.progress}: {exc}") from exc
     return _Progress(since, before, results)
 
@@ -546,7 +623,7 @@ def _cell(text: str) -> str:
 
 
 def render_markdown(rows: Sequence[ReportRow], since: datetime, aborted: bool, budget_exhausted: bool,
-                    budget: int) -> str:
+                    budget: int, unmatched: Sequence[str] = ()) -> str:
     processed = [r for r in rows if r.result is not None]
     missing = _not_covered(rows)
     lines = [
@@ -560,6 +637,8 @@ def render_markdown(rows: Sequence[ReportRow], since: datetime, aborted: bool, b
         "- Chats not reaching since: "
         + ("none" if not missing else "; ".join(f"{r.name} ({r.jid}): {_stop_text(r)}" for r in missing)),
     ]
+    if unmatched:
+        lines.append(f"- Selected chats with no stored message in the window: {', '.join(unmatched)}")
     if aborted:
         lines.append(f"- Aborted after {MAX_FAILURE_STREAK} consecutive failures; remaining chats were not processed")
     if budget_exhausted:
@@ -586,8 +665,15 @@ def render_markdown(rows: Sequence[ReportRow], since: datetime, aborted: bool, b
     return "\n".join(lines)
 
 
-CSV_HEADER = ("name", "jid", "before", "after", "new_in_window", "stored_new", "pages", "stop_reason",
+CSV_HEADER: tuple[str, ...] = ("name", "jid", "before", "after", "new_in_window", "stored_new", "pages", "stop_reason",
               "newest_stored", "errors", "new_messages")
+
+
+def _csv_cell(value: object) -> object:
+    """Prefix a text cell that a spreadsheet would read as a formula with a quote."""
+    if isinstance(value, str) and value.startswith(CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
 
 
 def write_csv(path: Path, rows: Sequence[ReportRow]) -> None:
@@ -595,7 +681,7 @@ def write_csv(path: Path, rows: Sequence[ReportRow]) -> None:
         writer = csv.writer(fh)
         writer.writerow(CSV_HEADER)
         for r in rows:
-            writer.writerow([
+            writer.writerow(_csv_cell(cell) for cell in [
                 r.name, r.jid, r.before, r.after, len(r.new_messages),
                 r.result.stored_new if r.result is not None else 0,
                 r.result.pages if r.result is not None else 0,
@@ -632,7 +718,8 @@ def run_backfill(config: Config, post: PostFn, sleep: SleepFn, jitter: JitterFn)
     after = snapshot_window(config.db, config.since, [c.jid for c in chats])
     rows = build_report_rows(chats, progress.before, after, progress.results)
     (config.out / "report.md").write_text(
-        render_markdown(rows, config.since, state.aborted, state.budget_exhausted, config.budget))
+        render_markdown(rows, config.since, state.aborted, state.budget_exhausted, config.budget,
+                        unmatched_only(config, {c.jid: c for c in chats})))
     write_csv(config.out / "report.csv", rows)
     exit_code = 1 if state.aborted or state.budget_exhausted or _not_covered(rows) else 0
     return RunOutcome(

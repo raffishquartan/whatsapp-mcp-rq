@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,19 +95,30 @@ def chat_not_in_answer() -> Response:
                  "request_id": "REQ", "reason": "chat_not_in_answer"}
 
 
-class FakeBridge:
-    """Scripted bridge: per chat, a queue of responses; records every request body."""
+def fresh_page(call_number: int) -> Response:
+    """A full page inside the window whose next anchor is new on every call."""
+    return ok(50, "2026-11-03T00:00:00Z", f"page-{call_number}")
 
-    def __init__(self, script: dict[str, list[Response]], default: Response | None = None) -> None:
+
+class FakeBridge:
+    """Scripted bridge: per chat, a queue of responses; records every request body.
+    When a chat's queue is empty it answers with default, or with
+    default_fn(call number) when that is given."""
+
+    def __init__(self, script: dict[str, list[Response]], default: Response | None = None,
+                 default_fn: Callable[[int], Response] | None = None) -> None:
         self.script = {jid: list(responses) for jid, responses in script.items()}
         self.default = default if default is not None else ok(0, None, None)
+        self.default_fn = default_fn
         self.calls: list[dict[str, object]] = []
 
     def __call__(self, body: dict[str, object]) -> Response:
         self.calls.append(body)
         jid = str(body["chat_jid"])
         queue = self.script.get(jid)
-        return queue.pop(0) if queue else self.default
+        if queue:
+            return queue.pop(0)
+        return self.default_fn(len(self.calls)) if self.default_fn is not None else self.default
 
     def chats_called(self) -> list[str]:
         seen: list[str] = []
@@ -263,7 +275,7 @@ def test_single_page_stop_reasons(
 
 def test_page_cap(db: Path, tmp_path: Path) -> None:
     config = make_config(db, tmp_path, "--only", "group1@g.us", "--max-pages-per-chat", "2")
-    bridge = FakeBridge({}, default=ok(50, "2026-11-03T00:00:00Z", "again"))
+    bridge = FakeBridge({}, default_fn=fresh_page)
     outcome = run(config, bridge)
     assert len(bridge.calls) == 2
     assert outcome.results[0].stop is hb.StopReason.PAGE_CAP
@@ -272,7 +284,7 @@ def test_page_cap(db: Path, tmp_path: Path) -> None:
 
 def test_budget_stops_before_exceeding(db: Path, tmp_path: Path) -> None:
     config = make_config(db, tmp_path, "--budget", "3")
-    bridge = FakeBridge({}, default=ok(50, "2026-11-03T00:00:00Z", "again"))
+    bridge = FakeBridge({}, default_fn=fresh_page)
     outcome = run(config, bridge)
     assert len(bridge.calls) == 3
     assert outcome.budget_exhausted
@@ -464,7 +476,7 @@ def test_report_outputs(db: Path, tmp_path: Path) -> None:
 
 def test_report_lists_chats_not_reaching_since(db: Path, tmp_path: Path) -> None:
     config = make_config(db, tmp_path, "--only", "group1@g.us", "--max-pages-per-chat", "1")
-    run(config, FakeBridge({}, default=ok(50, "2026-11-03T00:00:00Z", "again")))
+    run(config, FakeBridge({}, default_fn=fresh_page))
     report = (tmp_path / "out" / "report.md").read_text()
     assert "- Chats not reaching since: Chat A (group1@g.us): page cap" in report
 
@@ -596,3 +608,167 @@ def test_db_default_is_shown_in_help(capsys: pytest.CaptureFixture[str]) -> None
         hb.parse_args(["--help"])
     db_help = capsys.readouterr().out.split("--db DB")[-1].split("--bridge-url")[0]
     assert "default:" in db_help and "messages.db" in db_help
+
+
+# --- second review fixes ---
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        [ok(50, "2026-11-04T00:00:00Z", "g1-b")],  # next anchor is the anchor just requested
+        [ok(50, "2026-11-04T00:00:00Z", "p1"), ok(50, "2026-11-03T00:00:00Z", "g1-b")],  # back to an earlier anchor
+    ],
+    ids=["same-anchor", "cycle"],
+)
+def test_no_progress_stops_chat_without_repeating_requests(db: Path, tmp_path: Path, pages: list[Response]) -> None:
+    config = make_config(db, tmp_path, "--only", "group1@g.us")
+    bridge = FakeBridge({"group1@g.us": pages}, default_fn=fresh_page)
+    outcome = run(config, bridge)
+    assert len(bridge.calls) == len(pages)
+    result = outcome.results[0]
+    assert result.stop is hb.StopReason.NO_PROGRESS
+    assert result.stop not in hb.COMPLETE_REASONS and result.stop not in hb.COVERED_REASONS
+    assert "no progress" in result.errors[-1]
+    assert outcome.exit_code == 1
+    assert "group1@g.us" in (tmp_path / "out" / "report.md").read_text().split("Chats not reaching since:")[1]
+
+    rerun = FakeBridge({}, default=ok(0, None, None))
+    second = run(config, rerun)
+    assert rerun.calls == [{"chat_jid": "group1@g.us", "count": 50, "before_message_id": result.next_anchor}]
+    assert second.results[0].stop is hb.StopReason.START_OF_CHAT
+
+
+def test_no_progress_counts_towards_abort(db: Path, tmp_path: Path) -> None:
+    def same_anchor(body: dict[str, object]) -> Response:
+        calls.append(body)
+        return ok(50, "2026-11-04T00:00:00Z", str(body["before_message_id"]))
+
+    calls: list[dict[str, object]] = []
+    outcome = hb.run_backfill(make_config(db, tmp_path), same_anchor, Clock().sleep, lambda: 0.0)
+    assert outcome.aborted
+    assert len(calls) == 3
+    assert [r.stop for r in outcome.results] == [hb.StopReason.NO_PROGRESS] * 3
+
+
+def test_http_timeout_covers_bridge_maximum_with_margin() -> None:
+    main_go = (Path(__file__).resolve().parents[2] / "whatsapp-bridge" / "main.go").read_text()
+
+    def go_seconds(name: str) -> float:
+        match = re.search(rf"\b{name}\s*=\s*(\d+) \* time\.Second", main_go)
+        assert match is not None, name
+        return float(match.group(1))
+
+    bridge_max = go_seconds("historySyncSendTimeout") + go_seconds("historySyncWaitTimeout")
+    assert hb.BRIDGE_MAX_REQUEST_SECONDS == bridge_max
+    assert hb.HTTP_TIMEOUT_SECONDS == hb.BRIDGE_MAX_REQUEST_SECONDS + hb.HTTP_TIMEOUT_MARGIN_SECONDS
+    assert hb.HTTP_TIMEOUT_MARGIN_SECONDS >= 15.0
+
+
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@", "\t", "\r"])
+def test_write_csv_neutralises_formula_cells(tmp_path: Path, prefix: str) -> None:
+    name = f"{prefix}HYPERLINK(1)"
+    row = hb.ReportRow(name=name, jid="chat@g.us", before=0, after=0, new_messages=(), result=None,
+                       newest_stored="2026-01-02T00:00:00+00:00")
+    path = tmp_path / "report.csv"
+    hb.write_csv(path, [row])
+    with path.open(newline="") as fh:
+        written = list(csv.reader(fh))[1]
+    assert written[0] == "'" + name
+    assert written[1] == "chat@g.us"
+
+
+def test_write_csv_leaves_plain_cells_alone(tmp_path: Path) -> None:
+    row = hb.ReportRow(name="Chat A", jid="chat@g.us", before=0, after=0, new_messages=(), result=None,
+                       newest_stored="2026-01-02T00:00:00+00:00")
+    path = tmp_path / "report.csv"
+    hb.write_csv(path, [row])
+    with path.open(newline="") as fh:
+        assert list(csv.reader(fh))[1][0] == "Chat A"
+
+
+GOOD_RESULT: dict[str, object] = {
+    "stop": "page cap", "requests": 1, "pages": 1, "received": 50, "stored_new": 0, "stored_existing": 50,
+    "errors": [], "next_anchor": "p1", "jid": "group1@g.us",
+}
+GOOD_SNAPSHOT: dict[str, object] = {
+    "name": "Chat A", "messages": {"g1-a": "2026-11-02 10:00:00+00:00"}, "newest_id": "g1-a",
+    "newest_timestamp": "2026-11-02 10:00:00+00:00",
+}
+
+
+def progress_with(before: object = None, chats: object = None) -> str:
+    return json.dumps({
+        "since": SINCE,
+        "before": {"group1@g.us": GOOD_SNAPSHOT} if before is None else before,
+        "chats": {"group1@g.us": GOOD_RESULT} if chats is None else chats,
+    })
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[]",
+        json.dumps({"since": 20261101, "before": {}, "chats": {}}),
+        progress_with(before=[]),
+        progress_with(chats="x"),
+        progress_with(chats={"group1@g.us": {**GOOD_RESULT, "pages": "1"}}),
+        progress_with(chats={"group1@g.us": {**GOOD_RESULT, "requests": True}}),
+        progress_with(chats={"group1@g.us": {**GOOD_RESULT, "errors": "boom"}}),
+        progress_with(chats={"group1@g.us": {**GOOD_RESULT, "errors": [1]}}),
+        progress_with(chats={"group1@g.us": {**GOOD_RESULT, "next_anchor": None}}),
+        progress_with(chats={"group1@g.us": {**GOOD_RESULT, "stop": "nonsense"}}),
+        progress_with(chats={"group1@g.us": {**GOOD_RESULT, "received": 1.5}}),
+        progress_with(before={"group1@g.us": {**GOOD_SNAPSHOT, "name": 3}}),
+        progress_with(before={"group1@g.us": {**GOOD_SNAPSHOT, "messages": ["g1-a"]}}),
+        progress_with(before={"group1@g.us": {**GOOD_SNAPSHOT, "messages": {"g1-a": 5}}}),
+        progress_with(before={"group1@g.us": {**GOOD_SNAPSHOT, "newest_id": None}}),
+        progress_with(before={"group1@g.us": {**GOOD_SNAPSHOT, "newest_id": "missing"}}),
+    ],
+    ids=["not-object", "since-int", "before-list", "chats-str", "pages-str", "requests-bool", "errors-str",
+         "errors-int-item", "anchor-null", "stop-unknown", "received-float", "name-int", "messages-list",
+         "message-ts-int", "newest-null", "newest-not-in-messages"],
+)
+def test_progress_file_with_bad_types_exits_2(db: Path, tmp_path: Path, content: str,
+                                              caplog: pytest.LogCaptureFixture) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "progress.json").write_text(content)
+    bridge = FakeBridge({})
+    with pytest.raises(hb.BackfillError, match="progress file"):
+        hb.run_backfill(make_config(db, tmp_path, "--only", "group1@g.us"), bridge, Clock().sleep, lambda: 0.0)
+    assert bridge.calls == []
+
+
+def test_valid_progress_file_round_trips(db: Path, tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "progress.json").write_text(progress_with())
+    bridge = FakeBridge({}, default=ok(0, None, None))
+    outcome = run(make_config(db, tmp_path, "--only", "group1@g.us"), bridge)
+    assert bridge.calls == [{"chat_jid": "group1@g.us", "count": 50, "before_message_id": "p1"}]
+    assert outcome.results[0].pages == 2
+
+
+def test_only_jid_without_messages_in_window_is_warned_and_reported(
+    db: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    config = make_config(db, tmp_path, "--only", "group1@g.us", "--only", "old@g.us", "--only", "999@lid")
+    with caplog.at_level("WARNING"):
+        outcome = run(config, FakeBridge({}, default=ok(0, None, None)))
+    assert [r.jid for r in outcome.results] == ["group1@g.us"]
+    for jid in ("old@g.us", "999@lid"):
+        assert any(jid in rec.getMessage() and rec.levelname == "WARNING" for rec in caplog.records)
+    report = (tmp_path / "out" / "report.md").read_text()
+    assert "- Selected chats with no stored message in the window: old@g.us, 999@lid" in report
+
+
+def test_report_has_no_unmatched_only_line_without_only(db: Path, tmp_path: Path) -> None:
+    run(make_config(db, tmp_path, "--only", "group1@g.us"), FakeBridge({}))
+    assert "no stored message in the window" not in (tmp_path / "out" / "report.md").read_text()
+
+
+def test_module_constants_are_annotated() -> None:
+    source = Path(hb.__file__).read_text()
+    unannotated = re.findall(r"^([A-Z][A-Z0-9_]*) = ", source, flags=re.MULTILINE)
+    assert unannotated == []

@@ -179,14 +179,6 @@ func (store *MessageStore) OldestMessage(chatJID string) (storedAnchor, error) {
 	)
 }
 
-// NewestMessage returns the chat's newest stored message by timestamp.
-func (store *MessageStore) NewestMessage(chatJID string) (storedAnchor, error) {
-	return store.queryAnchor(
-		"SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC, id DESC LIMIT 1",
-		chatJID,
-	)
-}
-
 // MessageByID returns the stored message with the given id in the given chat.
 func (store *MessageStore) MessageByID(id, chatJID string) (storedAnchor, error) {
 	return store.queryAnchor(
@@ -771,8 +763,16 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// historySyncWaitTimeout is how long POST /api/request_history_sync waits for the phone's answer.
-const historySyncWaitTimeout = 60 * time.Second
+// Time limits of POST /api/request_history_sync. The send of the peer request is
+// bounded by historySyncSendTimeout; the wait for the phone's answer starts after the
+// send returns and is bounded by historySyncWaitTimeout. historySyncMaxDuration is
+// therefore the longest the handler takes after the anchor lookup; README documents it
+// and the backfill client's HTTP timeout is derived from it.
+const (
+	historySyncSendTimeout = 30 * time.Second
+	historySyncWaitTimeout = 60 * time.Second
+	historySyncMaxDuration = historySyncSendTimeout + historySyncWaitTimeout
+)
 
 // Bounds and default for the number of messages one history request asks for.
 const (
@@ -826,6 +826,14 @@ type historySyncError struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// historyChatNotInAnswerError is the JSON body of the 502 chat_not_in_answer response:
+// the error fields plus the JIDs of the conversations the answer did hold (always a
+// JSON array, empty when the answer held none).
+type historyChatNotInAnswerError struct {
+	historySyncError
+	Conversations []string `json:"conversations"`
+}
+
 // historyReasonChatNotInAnswer is the reason of the 502 returned when the phone's answer
 // to the request holds no conversation for the requested chat, so nothing can be
 // concluded about that chat's history (in particular, not that its start was reached).
@@ -843,9 +851,11 @@ func writeHistoryError(w http.ResponseWriter, status int, requestID, format stri
 
 // newHistorySyncHandler returns the handler for POST /api/request_history_sync. It
 // asks the primary phone for up to count messages before an anchor message stored in
-// messageStore, waits up to timeout for the matching ON_DEMAND history sync to be
-// stored (registry completion happens in handleHistorySync), and reports what changed.
-func newHistorySyncHandler(sender historySender, messageStore *MessageStore, registry *historyRequestRegistry, timeout time.Duration) http.Handler {
+// messageStore, bounding the send by sendTimeout, then waits up to waitTimeout for the
+// matching ON_DEMAND history sync to be stored (registry completion happens in
+// handleHistorySync), and reports what changed.
+func newHistorySyncHandler(sender historySender, messageStore *MessageStore, registry *historyRequestRegistry,
+	sendTimeout, waitTimeout time.Duration) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeHistoryError(w, http.StatusMethodNotAllowed, "", "method %s not allowed, use POST", r.Method)
@@ -919,7 +929,9 @@ func newHistorySyncHandler(sender historySender, messageStore *MessageStore, reg
 			ID:            anchor.ID,
 			Timestamp:     anchor.Timestamp,
 		}
-		resp, err := sender.SendPeerMessage(r.Context(), sender.BuildHistorySyncRequest(info, count))
+		sendCtx, cancelSend := context.WithTimeout(r.Context(), sendTimeout)
+		resp, err := sender.SendPeerMessage(sendCtx, sender.BuildHistorySyncRequest(info, count))
+		cancelSend()
 		if err != nil {
 			writeHistoryError(w, http.StatusBadGateway, "", "failed to send history request: %v", err)
 			return
@@ -927,23 +939,30 @@ func newHistorySyncHandler(sender historySender, messageStore *MessageStore, reg
 		registry.setRequestID(pending, resp.ID)
 		fmt.Printf("History request %s sent for %s (anchor %s, count %d)\n", resp.ID, chatJID, anchor.ID, count)
 
-		timer := time.NewTimer(timeout)
+		timer := time.NewTimer(waitTimeout)
 		defer timer.Stop()
 		select {
 		case answer := <-pending.done:
 			if !answer.ChatFound {
-				writeJSON(w, http.StatusBadGateway, historySyncError{
-					Success:   false,
-					Message:   fmt.Sprintf("answer to request %s held no conversation for chat %s (conversations in answer: %v)", resp.ID, chatJID, answer.Conversations),
-					RequestID: resp.ID,
-					Reason:    historyReasonChatNotInAnswer,
+				conversations := answer.Conversations
+				if conversations == nil {
+					conversations = []string{}
+				}
+				writeJSON(w, http.StatusBadGateway, historyChatNotInAnswerError{
+					historySyncError: historySyncError{
+						Success:   false,
+						Message:   fmt.Sprintf("answer to request %s held no conversation for chat %s (conversations in answer: %v)", resp.ID, chatJID, conversations),
+						RequestID: resp.ID,
+						Reason:    historyReasonChatNotInAnswer,
+					},
+					Conversations: conversations,
 				})
 				return
 			}
 			writeJSON(w, http.StatusOK, historyResponse(resp.ID, answer.Result))
 		case <-timer.C:
 			writeHistoryError(w, http.StatusGatewayTimeout, resp.ID,
-				"no answer from the phone within %s for request %s; a late answer is still stored", timeout, resp.ID)
+				"no answer from the phone within %s for request %s; a late answer is still stored", waitTimeout, resp.ID)
 		case <-r.Context().Done():
 			writeHistoryError(w, http.StatusGatewayTimeout, resp.ID, "client went away while waiting for request %s", resp.ID)
 		}
@@ -1107,7 +1126,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for requesting older history of a chat from the primary phone
 	http.Handle("/api/request_history_sync",
-		newHistorySyncHandler(whatsmeowHistorySender{client}, messageStore, historyRequests, historySyncWaitTimeout))
+		newHistorySyncHandler(whatsmeowHistorySender{client}, messageStore, historyRequests, historySyncSendTimeout, historySyncWaitTimeout))
 
 	// Start the server
 	// Bind to loopback only: the REST API has no auth, so allowing any
@@ -1377,12 +1396,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 }
 
 // historyMessageSender returns the messages.sender value for a history-sync message,
-// in the same form as live messages (see senderID): this account's user for its own
-// messages, the participant in a group, otherwise the chat's user.
+// in the same form as live messages (see senderID). Live group messages take the
+// sender from the participant attribute, which is this account's LID user in a
+// LID-addressed group, so the participant wins whenever it is set, own messages
+// included. Without a participant, own messages record ownUser (this account's phone
+// user) and other messages the chat's user.
 func historyMessageSender(participant string, isFromMe bool, chat types.JID, ownUser string, logger waLog.Logger) string {
 	switch {
-	case isFromMe:
-		return ownUser
 	case participant != "":
 		jid, err := types.ParseJID(participant)
 		if err != nil {
@@ -1390,6 +1410,8 @@ func historyMessageSender(participant string, isFromMe bool, chat types.JID, own
 			return participant
 		}
 		return senderID(jid)
+	case isFromMe:
+		return ownUser
 	default:
 		return senderID(chat)
 	}
