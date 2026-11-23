@@ -123,8 +123,12 @@ The project SHALL provide a backfill command that requests history for every cha
 - **THEN** it sends at most one request at a time, waits at least the configured delay (default 10 seconds, plus random jitter) between requests, and stops before exceeding the total request budget (default 150)
 
 #### Scenario: Error streak abort
-- **WHEN** three consecutive requests fail (any non-200 response other than 404)
+- **WHEN** three consecutive requests fail (any non-200 response other than 404 and other than the 502 `chat_not_in_answer`)
 - **THEN** the command stops sending, writes the report with the failures and exits non-zero
+
+#### Scenario: Chat not in answer does not abort the run
+- **WHEN** the bridge responds 502 with `reason: "chat_not_in_answer"` for several consecutive chats
+- **THEN** each chat is recorded as "chat not in answer" (not complete, not covered, retried on rerun), the failure streak is neither increased nor reset, and the run continues with the next chat
 
 #### Scenario: Resume after interruption
 - **WHEN** the command is rerun with the same progress file after an interrupted run

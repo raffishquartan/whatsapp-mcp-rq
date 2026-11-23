@@ -427,11 +427,12 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
     progress = _ChatProgress(chat.newest_id) if previous is None else _ChatProgress.resume(previous)
     requested: set[str] = set()
 
-    def fail(message: str, stop: StopReason = StopReason.FAILED) -> ChatResult:
+    def fail(message: str, stop: StopReason = StopReason.FAILED, counts_toward_abort: bool = True) -> ChatResult:
         progress.errors.append(message)
-        state.failure_streak += 1
-        if state.failure_streak >= MAX_FAILURE_STREAK:
-            state.aborted = True
+        if counts_toward_abort:
+            state.failure_streak += 1
+            if state.failure_streak >= MAX_FAILURE_STREAK:
+                state.aborted = True
         return progress.result(chat.jid, stop)
 
     while True:
@@ -454,7 +455,8 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
             progress.errors.append(_error_text(status, payload))
             return progress.result(chat.jid, StopReason.NO_ANCHOR)
         if status == 502 and payload.get("reason") == CHAT_NOT_IN_ANSWER_REASON:
-            return fail(_error_text(status, payload), StopReason.CHAT_NOT_IN_ANSWER)
+            # Recorded per chat but neither a failure nor a success: it does not move the abort streak.
+            return fail(_error_text(status, payload), StopReason.CHAT_NOT_IN_ANSWER, counts_toward_abort=False)
         if status != 200:
             return fail(_error_text(status, payload))
         try:

@@ -545,10 +545,22 @@ def test_inconclusive_answers_are_retried_on_rerun(db: Path, tmp_path: Path, res
     assert second.results[0].stop is hb.StopReason.START_OF_CHAT
 
 
-def test_chat_not_in_answer_counts_towards_abort(db: Path, tmp_path: Path) -> None:
+def test_chat_not_in_answer_does_not_count_towards_abort(db: Path, tmp_path: Path) -> None:
     outcome = run(make_config(db, tmp_path), FakeBridge({}, default=chat_not_in_answer()))
-    assert outcome.aborted
-    assert [r.stop for r in outcome.results] == [hb.StopReason.CHAT_NOT_IN_ANSWER] * 3
+    assert not outcome.aborted
+    assert len(outcome.results) > hb.MAX_FAILURE_STREAK
+    assert {r.stop for r in outcome.results} == {hb.StopReason.CHAT_NOT_IN_ANSWER}
+
+
+def test_chat_not_in_answer_does_not_reset_failure_streak(db: Path, tmp_path: Path) -> None:
+    bridge = FakeBridge({}, default=chat_not_in_answer())
+    config = make_config(db, tmp_path)
+    state = hb._RunState()
+    state.failure_streak = hb.MAX_FAILURE_STREAK - 1
+    chat = hb.select_chats(config)[0]
+    hb.backfill_chat(chat, config, bridge, state, hb._Pacer(0.0, lambda _s: None, lambda: 0.0))
+    assert state.failure_streak == hb.MAX_FAILURE_STREAK - 1
+    assert not state.aborted
 
 
 def test_page_cap_resumes_from_last_anchor_with_higher_cap(db: Path, tmp_path: Path) -> None:
