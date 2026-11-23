@@ -159,6 +159,111 @@ You can send various media types to your WhatsApp contacts:
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
 
+### Backfilling Missed History
+
+Messages that arrive while the bridge is not running are not in `messages.db`. The bridge can ask your phone for older messages of a chat, one page at a time. This only pages **backwards** from a message already stored: it cannot recover messages newer than a chat's newest stored message (those arrive through WhatsApp's offline queue when the bridge reconnects). Your phone must be online (Wi-Fi or mobile data), because it serves the answer.
+
+#### Endpoint: `POST /api/request_history_sync`
+
+Loopback only (`http://localhost:8080/api/request_history_sync`). One request at a time; the call blocks until the phone answers or 60 seconds pass.
+
+Request body (JSON):
+
+| Field | Required | Meaning |
+|---|---|---|
+| `chat_jid` | yes | Chat to backfill, e.g. `123456789@g.us` or `123@lid`. Broadcast chats are rejected. |
+| `count` | no | Messages to ask for, 1-100 (default 50). |
+| `before_message_id` | no | Stored message id to page back from (default: the chat's oldest stored message). |
+
+Successful response (200):
+
+```json
+{
+  "success": true,
+  "message": "received 50 messages for 123456789@g.us",
+  "request_id": "3EB0...",
+  "received": 50,
+  "stored_new": 12,
+  "stored_existing": 36,
+  "skipped": 2,
+  "oldest_timestamp": "2026-10-28T09:14:03Z",
+  "next_before_message_id": "3A1F..."
+}
+```
+
+- `received`: messages in the answer for the chat; `stored_new`: rows that were not in `messages.db`; `stored_existing`: rows that were already there and were rewritten; `skipped`: messages with no text and no media.
+- `next_before_message_id` is the oldest stored message from the answer: pass it as `before_message_id` to get the next older page. It is `null` (with `received: 0`) at the start of the chat.
+- Storage is idempotent, so overlapping pages are harmless, and an older page never moves a chat's last-message time backwards.
+
+Errors return `{"success": false, "message": "..."}` and send nothing to WhatsApp unless noted:
+
+| Status | When |
+|---|---|
+| 400 | Malformed JSON, missing/invalid `chat_jid`, broadcast chat, `count` outside 1-100 |
+| 404 | No stored message in the chat to anchor on, or `before_message_id` not stored for the chat |
+| 405 | Method other than POST |
+| 409 | Another history request is still waiting for its answer |
+| 502 | Sending the request to the phone failed (message has the error) |
+| 503 | Bridge not connected or not logged in |
+| 504 | No answer within 60 seconds (body includes `request_id`); a late answer is still stored |
+
+Example:
+
+```bash
+curl -s -X POST http://localhost:8080/api/request_history_sync \
+  -H 'Content-Type: application/json' \
+  -d '{"chat_jid": "123456789@g.us", "count": 50}'
+```
+
+#### Bulk backfill: `whatsapp-history-backfill`
+
+Run from `whatsapp-mcp-server/` with the bridge running:
+
+```bash
+uv run whatsapp-history-backfill --since 2026-11-01 --out /path/to/working/backfill --dry-run   # list chats, send nothing
+uv run whatsapp-history-backfill --since 2026-11-01 --out /path/to/working/backfill --canary <group-jid>
+```
+
+What it does:
+
+1. Snapshots, from `messages.db` opened read-only, every non-broadcast chat with a message on or after `--since` (UTC), with the ids of its messages in that window.
+2. Orders the chats: `--canary` first, then groups, then direct chats, each most recently active first.
+3. For each chat, requests 50 messages before the chat's newest stored message, then follows `next_before_message_id` until the answer's oldest message is older than `--since` ("reached since"), the start of the chat is reached ("start of chat"), or `--max-pages-per-chat` is hit ("page cap").
+4. Paces requests: one at a time, at least `--delay` seconds plus 0-5 seconds of random jitter apart, never more than `--budget` requests in total. A 409 waits and retries once; a 504 or other failure moves on to the next chat; three consecutive failures (404 does not count) abort the run.
+5. Saves progress after each chat to `--progress`; rerunning with the same file skips completed chats and retries failed ones.
+6. Re-snapshots and writes `report.md` and `report.csv` to `--out`: per chat, the window counts before and after, the new message ids and timestamps (never message content), pages, stop reason, newest stored timestamp and errors, plus a summary listing any chat that did not reach `--since`.
+
+Exit status: 0 when every chat reached `--since` or its start; 1 when the run aborted, ran out of budget, or any chat stopped for another reason; 2 for invalid input (including a selection with no chats).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--since DATE` | required | Window start, ISO date in UTC (`YYYY-MM-DD`) |
+| `--out DIR` | required | Directory for `report.md`, `report.csv` and `progress.json`; keep it outside the repository |
+| `--db PATH` | `whatsapp-bridge/store/messages.db` | Database to read (read-only) |
+| `--bridge-url URL` | `http://localhost:8080/api` | Bridge REST API base URL |
+| `--only JID` | all chats | Process only this chat; repeat for several |
+| `--canary JID` | none | Process this chat first (ignored with a warning if it has no messages in the window) |
+| `--delay SECONDS` | 10 | Minimum gap between requests, plus 0-5 s jitter |
+| `--budget N` | 150 | Maximum requests in this run |
+| `--max-pages-per-chat N` | 10 | Maximum pages of 50 messages per chat |
+| `--progress PATH` | `OUT/progress.json` | Progress file used to resume |
+| `--dry-run` | off | List the chats and their current counts; send nothing |
+
+#### Ban-risk checklist
+
+Each request is a peer message to your own phone, the same request WhatsApp Web sends when you scroll up past its local cache. Risk comes from volume and pattern, so before a bulk run:
+
+- Search for recent reports of WhatsApp bans affecting unofficial/linked-device clients; do not run if there is a fresh wave.
+- Back up `messages.db` (copy it while the bridge is stopped, or use `sqlite3 messages.db ".backup backup.db"`).
+- Run with `--dry-run` first and check the chat list.
+- Start with a canary: `--only <one-chat-jid>` or `--canary <one-chat-jid>`, and check its report before the full run.
+- Keep the default pacing and budget; never run two backfills at once.
+- If WhatsApp shows any warning, stop and do not rerun.
+
+#### If the phone never answers
+
+Answers are not guaranteed. If requests keep timing out (504) or always come back empty for a chat you know has older messages, treat the endpoint as best effort: report the chats concerned, check the gap by hand on the phone, and do not retry in a loop. If no request is ever answered across several attempts on different days with the phone confirmed online, stop using the feature.
+
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server

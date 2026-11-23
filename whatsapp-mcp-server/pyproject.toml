@@ -1,6 +1,6 @@
 [project]
 name = "whatsapp-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -11,11 +11,30 @@ dependencies = [
     "tzdata>=2024.1",
 ]
 
+[project.scripts]
+whatsapp-history-backfill = "history_backfill:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Flat layout: history_backfill imports its defaults from whatsapp, which imports audio.
+py-modules = ["history_backfill", "whatsapp", "audio"]
+
 [dependency-groups]
 dev = [
+    "mypy>=1.10",
     "pytest>=8.0",
+    "types-requests>=2.32",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[[tool.mypy.overrides]]
+# history_backfill is checked with --strict; these older modules predate that and
+# are analysed for their signatures only, without reporting their own errors.
+module = ["whatsapp", "audio"]
+follow_imports = "silent"
