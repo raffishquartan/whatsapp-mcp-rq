@@ -563,6 +563,26 @@ def test_chat_not_in_answer_does_not_reset_failure_streak(db: Path, tmp_path: Pa
     assert not state.aborted
 
 
+def test_chat_not_in_answer_between_failures_does_not_hide_the_streak(db: Path, tmp_path: Path) -> None:
+    # failure, failure, chat_not_in_answer, failure: the third real failure still aborts.
+    config = make_config(db, tmp_path)
+    jids = [c.jid for c in hb.select_chats(config)][:4]
+    bridge = FakeBridge({jids[0]: [(500, {"message": "boom"})], jids[1]: [(500, {"message": "boom"})],
+                         jids[2]: [chat_not_in_answer()], jids[3]: [(500, {"message": "boom"})]})
+    outcome = run(config, bridge)
+    assert outcome.aborted
+    assert [r.stop for r in outcome.results][:4] == [hb.StopReason.FAILED, hb.StopReason.FAILED,
+                                                    hb.StopReason.CHAT_NOT_IN_ANSWER, hb.StopReason.FAILED]
+
+
+def test_report_summarises_chats_not_in_answer(db: Path, tmp_path: Path) -> None:
+    config = make_config(db, tmp_path)
+    run(config, FakeBridge({}, default=chat_not_in_answer()))
+    report = (config.out / "report.md").read_text()
+    assert "chat not in answer" in report.lower()
+    assert "systemic matching problem" in report
+
+
 def test_page_cap_resumes_from_last_anchor_with_higher_cap(db: Path, tmp_path: Path) -> None:
     config = make_config(db, tmp_path, "--only", "group1@g.us", "--max-pages-per-chat", "2")
     run(config, FakeBridge({"group1@g.us": [ok(50, "2026-11-04T00:00:00Z", "p1"),

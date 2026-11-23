@@ -639,6 +639,10 @@ def render_markdown(rows: Sequence[ReportRow], since: datetime, aborted: bool, b
         "- Chats not reaching since: "
         + ("none" if not missing else "; ".join(f"{r.name} ({r.jid}): {_stop_text(r)}" for r in missing)),
     ]
+    not_in_answer = sum(1 for r in processed if r.result is not None and r.result.stop is StopReason.CHAT_NOT_IN_ANSWER)
+    if not_in_answer:
+        lines.append(f"- Chats whose answer held no conversation for them (\"chat not in answer\"): {not_in_answer}; "
+                     "these do not abort the run, but many of them point to a systemic matching problem")
     if unmatched:
         lines.append(f"- Selected chats with no stored message in the window: {', '.join(unmatched)}")
     if aborted:
