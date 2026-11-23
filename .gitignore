@@ -8,3 +8,6 @@ INSTALLED_COMMIT_HASH
 
 # Built bridge binary and any local backups (~28MB each, never tracked).
 whatsapp-bridge/whatsapp-bridge*
+# Runtime data and OS noise
+whatsapp-bridge/store/
+.DS_Store
