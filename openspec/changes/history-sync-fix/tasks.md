@@ -76,3 +76,7 @@
 - [x] 10.8 Backfill: warn about and report `--only` chats with no stored message in the window; verify with pytest
 - [x] 10.9 Backfill: annotate all module-level constants; verify with a pytest and `mypy --strict`
 - [x] 10.10 Docs: neutral wording for the private message store in design.md; generic `--since` example in README
+
+## 11. Owner decision: chat-not-in-answer does not abort
+
+- [x] 11.1 Backfill: a 502 `chat_not_in_answer` is recorded per chat but neither increments nor resets the three-failure abort streak; verify with pytest (many such chats do not abort; the streak is unchanged by one)
