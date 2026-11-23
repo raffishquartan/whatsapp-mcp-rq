@@ -62,7 +62,7 @@ func TestStoreMessagePersistsUTC(t *testing.T) {
 	for _, tc := range timestampCases(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			id := "ts-" + tc.name
-			if err := store.StoreMessage(id, "chat@g.us", "sender", "hello", tc.in, false,
+			if _, err := store.StoreMessage(id, "chat@g.us", "sender", "hello", tc.in, false,
 				"", "", "", nil, nil, nil, 0); err != nil {
 				t.Fatalf("StoreMessage: %v", err)
 			}
@@ -94,7 +94,7 @@ func TestStoreMessageReplaceKeepsUTC(t *testing.T) {
 	plusTwo := time.FixedZone("UTC+2", 2*60*60)
 	london := mustLoadLocation(t, "Europe/London")
 	for _, in := range []time.Time{instant.In(london), instant.In(plusTwo)} {
-		if err := store.StoreMessage("dup", "chat@g.us", "sender", "hello", in, false,
+		if _, err := store.StoreMessage("dup", "chat@g.us", "sender", "hello", in, false,
 			"", "", "", nil, nil, nil, 0); err != nil {
 			t.Fatalf("StoreMessage: %v", err)
 		}
@@ -116,7 +116,7 @@ func TestChatAndMessageTimesJoinEqual(t *testing.T) {
 	// Message and chat get the same instant in different zones, as the live and
 	// history-sync paths can when the host zone differs from the sender's.
 	instant := time.Date(2026, 8, 24, 22, 25, 15, 0, time.UTC)
-	if err := store.StoreMessage("last", "chat@g.us", "sender", "hello",
+	if _, err := store.StoreMessage("last", "chat@g.us", "sender", "hello",
 		instant.In(time.FixedZone("UTC+2", 2*60*60)), false, "", "", "", nil, nil, nil, 0); err != nil {
 		t.Fatalf("StoreMessage: %v", err)
 	}

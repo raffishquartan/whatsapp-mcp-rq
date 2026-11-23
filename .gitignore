@@ -11,3 +11,4 @@ whatsapp-bridge/whatsapp-bridge*
 # Runtime data and OS noise
 whatsapp-bridge/store/
 .DS_Store
+whatsapp-bridge/whatsapp-client

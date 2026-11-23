@@ -141,7 +141,7 @@ func storeExtracted(t *testing.T, store *MessageStore, id string, msg *waProto.M
 	unwrapped := unwrapMessage(msg)
 	content := extractTextContent(unwrapped)
 	mediaType, filename, url, key, sha, encSha, length := extractMediaInfo(unwrapped)
-	err := store.StoreMessage(id, "chat@g.us", "sender", content, time.Unix(1700000100, 0), false,
+	_, err := store.StoreMessage(id, "chat@g.us", "sender", content, time.Unix(1700000100, 0), false,
 		mediaType, filename, url, key, sha, encSha, length)
 	if err != nil {
 		t.Fatalf("StoreMessage: %v", err)

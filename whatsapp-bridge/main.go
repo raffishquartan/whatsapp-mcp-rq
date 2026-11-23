@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,6 +27,8 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -54,8 +58,11 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	// Open SQLite database for messages. Transactions take the write lock when they
+	// begin (_txlock=immediate) so StoreMessage's read-then-write transaction cannot
+	// deadlock against a concurrent writer (live and history events run concurrently);
+	// a writer that finds the lock held waits up to _busy_timeout milliseconds.
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_txlock=immediate&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -100,30 +107,84 @@ func (store *MessageStore) Close() error {
 }
 
 // Store a chat in the database. The time is stored as UTC so every row shares one
-// offset: go-sqlite3 writes a time.Time as text in its own Location.
+// offset: go-sqlite3 writes a time.Time as text in its own Location. Because every
+// row is UTC text in the same format, MAX compares instants, so a history-sync chunk
+// of older messages never moves last_message_time backwards.
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name = excluded.name,
+			last_message_time = MAX(COALESCE(last_message_time, excluded.last_message_time), excluded.last_message_time)`,
 		jid, name, lastMessageTime.UTC(),
 	)
 	return err
 }
 
 // Store a message in the database. The timestamp is stored as UTC (see StoreChat).
+// An existing row with the same (id, chat_jid) is rewritten; existed reports whether
+// one was there. A message with no content and no media is not stored.
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	// Only store if there's actual content or media
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) (existed bool, err error) {
 	if content == "" && mediaType == "" {
-		return nil
+		return false, nil
 	}
 
-	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
+	tx, err := store.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	if err := tx.QueryRow(
+		"SELECT EXISTS(SELECT 1 FROM messages WHERE id = ? AND chat_jid = ?)", id, chatJID,
+	).Scan(&existed); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp.UTC(), isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	); err != nil {
+		return false, err
+	}
+	return existed, tx.Commit()
+}
+
+// storedAnchor is the part of a stored message that a history-sync request is anchored on.
+type storedAnchor struct {
+	ID        string
+	IsFromMe  bool
+	Timestamp time.Time
+}
+
+// errNoStoredMessage is returned by the anchor lookups when no matching message is stored.
+var errNoStoredMessage = errors.New("no stored message")
+
+func (store *MessageStore) queryAnchor(query string, args ...any) (storedAnchor, error) {
+	var a storedAnchor
+	err := store.db.QueryRow(query, args...).Scan(&a.ID, &a.IsFromMe, &a.Timestamp)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storedAnchor{}, errNoStoredMessage
+	}
+	return a, err
+}
+
+// OldestMessage returns the chat's oldest stored message by timestamp.
+func (store *MessageStore) OldestMessage(chatJID string) (storedAnchor, error) {
+	return store.queryAnchor(
+		"SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC, id ASC LIMIT 1",
+		chatJID,
 	)
-	return err
+}
+
+// MessageByID returns the stored message with the given id in the given chat.
+func (store *MessageStore) MessageByID(id, chatJID string) (storedAnchor, error) {
+	return store.queryAnchor(
+		"SELECT id, is_from_me, timestamp FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	)
 }
 
 // Get messages from a chat
@@ -425,10 +486,17 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 }
 
 // Handle regular incoming messages with media support
+// senderID is how messages.sender records a sender: the user part of the JID (phone
+// number or LID user), without server or device. Live and history-sync messages both
+// use it, so a history rewrite of a live row keeps the same sender value.
+func senderID(jid types.JID) string {
+	return jid.User
+}
+
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	sender := senderID(msg.Info.Sender)
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -451,7 +519,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	// Store message in database
-	err = messageStore.StoreMessage(
+	_, err = messageStore.StoreMessage(
 		msg.Info.ID,
 		chatJID,
 		sender,
@@ -695,6 +763,233 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// Time limits of POST /api/request_history_sync. The send of the peer request is
+// bounded by historySyncSendTimeout; the wait for the phone's answer starts after the
+// send returns and is bounded by historySyncWaitTimeout. historySyncMaxDuration is
+// therefore the longest the handler takes after the anchor lookup; README documents it
+// and the backfill client's HTTP timeout is derived from it.
+const (
+	historySyncSendTimeout = 30 * time.Second
+	historySyncWaitTimeout = 60 * time.Second
+	historySyncMaxDuration = historySyncSendTimeout + historySyncWaitTimeout
+)
+
+// Bounds and default for the number of messages one history request asks for.
+const (
+	historySyncDefaultCount = 50
+	historySyncMaxCount     = 100
+)
+
+// historySender is the part of the WhatsApp client the history-request endpoint uses.
+type historySender interface {
+	IsConnected() bool
+	HasDeviceID() bool
+	BuildHistorySyncRequest(lastKnownMessageInfo *types.MessageInfo, count int) *waE2E.Message
+	SendPeerMessage(ctx context.Context, message *waE2E.Message) (whatsmeow.SendResponse, error)
+}
+
+// whatsmeowHistorySender adapts *whatsmeow.Client to historySender.
+type whatsmeowHistorySender struct {
+	*whatsmeow.Client
+}
+
+// HasDeviceID reports whether the client has a stored device identity (is logged in).
+func (s whatsmeowHistorySender) HasDeviceID() bool {
+	return s.Store.ID != nil
+}
+
+// historySyncRequest is the JSON body of POST /api/request_history_sync.
+type historySyncRequest struct {
+	ChatJID         string `json:"chat_jid"`
+	Count           *int   `json:"count"`
+	BeforeMessageID string `json:"before_message_id"`
+}
+
+// historySyncResponse is the JSON body of a successful history request.
+type historySyncResponse struct {
+	Success             bool    `json:"success"`
+	Message             string  `json:"message"`
+	RequestID           string  `json:"request_id"`
+	Received            int     `json:"received"`
+	StoredNew           int     `json:"stored_new"`
+	StoredExisting      int     `json:"stored_existing"`
+	Skipped             int     `json:"skipped"`
+	OldestTimestamp     *string `json:"oldest_timestamp"`
+	NextBeforeMessageID *string `json:"next_before_message_id"`
+}
+
+// historySyncError is the JSON body of a failed history request.
+type historySyncError struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	RequestID string `json:"request_id,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// historyChatNotInAnswerError is the JSON body of the 502 chat_not_in_answer response:
+// the error fields plus the JIDs of the conversations the answer did hold (always a
+// JSON array, empty when the answer held none).
+type historyChatNotInAnswerError struct {
+	historySyncError
+	Conversations []string `json:"conversations"`
+}
+
+// historyReasonChatNotInAnswer is the reason of the 502 returned when the phone's answer
+// to the request holds no conversation for the requested chat, so nothing can be
+// concluded about that chat's history (in particular, not that its start was reached).
+const historyReasonChatNotInAnswer = "chat_not_in_answer"
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(body)
+}
+
+func writeHistoryError(w http.ResponseWriter, status int, requestID, format string, args ...any) {
+	writeJSON(w, status, historySyncError{Success: false, Message: fmt.Sprintf(format, args...), RequestID: requestID})
+}
+
+// newHistorySyncHandler returns the handler for POST /api/request_history_sync. It
+// asks the primary phone for up to count messages before an anchor message stored in
+// messageStore, bounding the send by sendTimeout, then waits up to waitTimeout for the
+// matching ON_DEMAND history sync to be stored (registry completion happens in
+// handleHistorySync), and reports what changed.
+func newHistorySyncHandler(sender historySender, messageStore *MessageStore, registry *historyRequestRegistry,
+	sendTimeout, waitTimeout time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeHistoryError(w, http.StatusMethodNotAllowed, "", "method %s not allowed, use POST", r.Method)
+			return
+		}
+
+		var req historySyncRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeHistoryError(w, http.StatusBadRequest, "", "invalid JSON body: %v", err)
+			return
+		}
+		if req.ChatJID == "" {
+			writeHistoryError(w, http.StatusBadRequest, "", "chat_jid is required")
+			return
+		}
+		jid, err := types.ParseJID(req.ChatJID)
+		if err != nil || jid.User == "" {
+			writeHistoryError(w, http.StatusBadRequest, "", "invalid chat_jid %q", req.ChatJID)
+			return
+		}
+		if jid.Server == types.BroadcastServer {
+			writeHistoryError(w, http.StatusBadRequest, "", "broadcast chats cannot be backfilled: %s", req.ChatJID)
+			return
+		}
+		count := historySyncDefaultCount
+		if req.Count != nil {
+			count = *req.Count
+		}
+		if count < 1 || count > historySyncMaxCount {
+			writeHistoryError(w, http.StatusBadRequest, "", "count must be between 1 and %d, got %d", historySyncMaxCount, count)
+			return
+		}
+
+		chatJID := jid.String()
+		var anchor storedAnchor
+		if req.BeforeMessageID != "" {
+			anchor, err = messageStore.MessageByID(req.BeforeMessageID, chatJID)
+		} else {
+			anchor, err = messageStore.OldestMessage(chatJID)
+		}
+		switch {
+		case errors.Is(err, errNoStoredMessage) && req.BeforeMessageID != "":
+			writeHistoryError(w, http.StatusNotFound, "", "message %s is not stored for chat %s", req.BeforeMessageID, chatJID)
+			return
+		case errors.Is(err, errNoStoredMessage):
+			writeHistoryError(w, http.StatusNotFound, "", "no stored message to anchor on in chat %s", chatJID)
+			return
+		case err != nil:
+			writeHistoryError(w, http.StatusInternalServerError, "", "failed to read anchor message: %v", err)
+			return
+		}
+
+		if !sender.IsConnected() {
+			writeHistoryError(w, http.StatusServiceUnavailable, "", "bridge is not connected to WhatsApp")
+			return
+		}
+		if !sender.HasDeviceID() {
+			writeHistoryError(w, http.StatusServiceUnavailable, "", "bridge is not logged in to WhatsApp")
+			return
+		}
+
+		pending, ok := registry.begin(chatJID)
+		if !ok {
+			writeHistoryError(w, http.StatusConflict, "", "another history request is already in flight")
+			return
+		}
+		defer registry.finish(pending)
+
+		info := &types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: jid, IsFromMe: anchor.IsFromMe},
+			ID:            anchor.ID,
+			Timestamp:     anchor.Timestamp,
+		}
+		sendCtx, cancelSend := context.WithTimeout(r.Context(), sendTimeout)
+		resp, err := sender.SendPeerMessage(sendCtx, sender.BuildHistorySyncRequest(info, count))
+		cancelSend()
+		if err != nil {
+			writeHistoryError(w, http.StatusBadGateway, "", "failed to send history request: %v", err)
+			return
+		}
+		registry.setRequestID(pending, resp.ID)
+		fmt.Printf("History request %s sent for %s (anchor %s, count %d)\n", resp.ID, chatJID, anchor.ID, count)
+
+		timer := time.NewTimer(waitTimeout)
+		defer timer.Stop()
+		select {
+		case answer := <-pending.done:
+			if !answer.ChatFound {
+				conversations := answer.Conversations
+				if conversations == nil {
+					conversations = []string{}
+				}
+				writeJSON(w, http.StatusBadGateway, historyChatNotInAnswerError{
+					historySyncError: historySyncError{
+						Success:   false,
+						Message:   fmt.Sprintf("answer to request %s held no conversation for chat %s (conversations in answer: %v)", resp.ID, chatJID, conversations),
+						RequestID: resp.ID,
+						Reason:    historyReasonChatNotInAnswer,
+					},
+					Conversations: conversations,
+				})
+				return
+			}
+			writeJSON(w, http.StatusOK, historyResponse(resp.ID, answer.Result))
+		case <-timer.C:
+			writeHistoryError(w, http.StatusGatewayTimeout, resp.ID,
+				"no answer from the phone within %s for request %s; a late answer is still stored", waitTimeout, resp.ID)
+		case <-r.Context().Done():
+			writeHistoryError(w, http.StatusGatewayTimeout, resp.ID, "client went away while waiting for request %s", resp.ID)
+		}
+	})
+}
+
+func historyResponse(requestID string, result conversationResult) historySyncResponse {
+	resp := historySyncResponse{
+		Success:        true,
+		Message:        fmt.Sprintf("received %d messages for %s", result.Received, result.ChatJID),
+		RequestID:      requestID,
+		Received:       result.Received,
+		StoredNew:      result.StoredNew,
+		StoredExisting: result.StoredExisting,
+		Skipped:        result.Skipped,
+	}
+	if !result.OldestTimestamp.IsZero() {
+		ts := result.OldestTimestamp.UTC().Format(time.RFC3339)
+		resp.OldestTimestamp = &ts
+	}
+	if result.OldestStoredID != "" {
+		id := result.OldestStoredID
+		resp.NextBeforeMessageID = &id
+	}
+	return resp
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
@@ -828,6 +1123,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Path:     path,
 		})
 	})
+
+	// Handler for requesting older history of a chat from the primary phone
+	http.Handle("/api/request_history_sync",
+		newHistorySyncHandler(whatsmeowHistorySender{client}, messageStore, historyRequests, historySyncSendTimeout, historySyncWaitTimeout))
 
 	// Start the server
 	// Bind to loopback only: the REST API has no auth, so allowing any
@@ -1063,10 +1362,68 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	return name
 }
 
-// Handle history sync events
+// conversationResult is what storing one conversation of a history sync did.
+type conversationResult struct {
+	ChatJID         string
+	Received        int       // messages in the answer with a message body
+	StoredNew       int       // rows that did not exist before
+	StoredExisting  int       // rows that already existed and were rewritten
+	Skipped         int       // messages with no text and no media, or no timestamp
+	OldestTimestamp time.Time // oldest message in the answer (zero when none)
+	OldestStoredID  string    // oldest message from the answer that was stored ("" when none)
+}
+
+// historyAnswer is what the registry hands to the waiting request. ChatFound is false
+// when the sync matched by request id but held no conversation for the requested chat;
+// Conversations then lists the chats it did hold.
+type historyAnswer struct {
+	Result        conversationResult
+	ChatFound     bool
+	Conversations []string
+}
+
+// chatNamer resolves a chat's display name for a history-sync conversation.
+type chatNamer func(jid types.JID, chatJID string, conversation *waHistorySync.Conversation) string
+
+// Handle history sync events: store every conversation, then hand the results to a
+// pending on-demand history request if this sync answers it.
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
+	namer := func(jid types.JID, chatJID string, conversation *waHistorySync.Conversation) string {
+		return GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+	}
+	results := storeHistorySync(messageStore, historySync, namer, client.Store.ID.User, logger)
+	historyRequests.offer(historySync, results)
+}
+
+// historyMessageSender returns the messages.sender value for a history-sync message,
+// in the same form as live messages (see senderID). Live group messages take the
+// sender from the participant attribute, which is this account's LID user in a
+// LID-addressed group, so the participant wins whenever it is set, own messages
+// included. Without a participant, own messages record ownUser (this account's phone
+// user) and other messages the chat's user.
+func historyMessageSender(participant string, isFromMe bool, chat types.JID, ownUser string, logger waLog.Logger) string {
+	switch {
+	case participant != "":
+		jid, err := types.ParseJID(participant)
+		if err != nil {
+			logger.Warnf("Failed to parse participant JID %s, storing it unparsed: %v", participant, err)
+			return participant
+		}
+		return senderID(jid)
+	case isFromMe:
+		return ownUser
+	default:
+		return senderID(chat)
+	}
+}
+
+// storeHistorySync stores the messages of every conversation in a history sync and
+// returns one result per conversation with a parseable JID, including conversations
+// with no messages. ownUser is the sender recorded for messages sent by this account.
+func storeHistorySync(messageStore *MessageStore, historySync *events.HistorySync, namer chatNamer, ownUser string, logger waLog.Logger) []conversationResult {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
+	var results []conversationResult
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
@@ -1084,147 +1441,206 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
-		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+		name := namer(jid, chatJID, conversation)
 
-		// Process messages
 		messages := conversation.Messages
-		if len(messages) > 0 {
-			// Update chat with latest message timestamp
-			latestMsg := messages[0]
-			if latestMsg == nil || latestMsg.Message == nil {
+		result := conversationResult{ChatJID: chatJID}
+
+		// Update the chat with the newest timestamp in the answer (the answer's order is
+		// not relied on, and messages without a timestamp are ignored). With no timestamp
+		// at all nothing below is stored, so the chat row is not needed.
+		var newest time.Time
+		for _, msg := range messages {
+			if msg == nil || msg.Message == nil {
 				continue
 			}
-
-			// Get timestamp from message info
-			timestamp := time.Time{}
-			if ts := latestMsg.Message.GetMessageTimestamp(); ts != 0 {
-				timestamp = time.Unix(int64(ts), 0)
-			} else {
-				continue
-			}
-
-			messageStore.StoreChat(chatJID, name, timestamp)
-
-			// Store messages
-			for _, msg := range messages {
-				if msg == nil || msg.Message == nil {
-					continue
-				}
-
-				// Unwrap like live events, then extract content and media info
-				unwrapped := unwrapMessage(msg.Message.Message)
-				content := extractTextContent(unwrapped)
-				mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(unwrapped)
-
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
-
-				// Skip messages with no content and no media
-				if content == "" && mediaType == "" {
-					continue
-				}
-
-				// Determine sender
-				var sender string
-				isFromMe := false
-				if msg.Message.Key != nil {
-					if msg.Message.Key.FromMe != nil {
-						isFromMe = *msg.Message.Key.FromMe
-					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
-					} else if isFromMe {
-						sender = client.Store.ID.User
-					} else {
-						sender = jid.User
-					}
-				} else {
-					sender = jid.User
-				}
-
-				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
-				}
-
-				// Get message timestamp
-				timestamp := time.Time{}
-				if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
-					timestamp = time.Unix(int64(ts), 0)
-				} else {
-					continue
-				}
-
-				err = messageStore.StoreMessage(
-					msgID,
-					chatJID,
-					sender,
-					content,
-					timestamp,
-					isFromMe,
-					mediaType,
-					filename,
-					url,
-					mediaKey,
-					fileSHA256,
-					fileEncSHA256,
-					fileLength,
-				)
-				if err != nil {
-					logger.Warnf("Failed to store history message: %v", err)
-				} else {
-					syncedCount++
-					// Log successful message storage
-					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
-					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
-					}
-				}
+			if ts := msg.Message.GetMessageTimestamp(); ts != 0 && time.Unix(int64(ts), 0).After(newest) {
+				newest = time.Unix(int64(ts), 0)
 			}
 		}
+		if !newest.IsZero() {
+			if err := messageStore.StoreChat(chatJID, name, newest); err != nil {
+				logger.Warnf("Failed to store chat %s: %v", chatJID, err)
+			}
+		}
+
+		var oldestStored time.Time
+		for _, msg := range messages {
+			if msg == nil || msg.Message == nil {
+				continue
+			}
+			result.Received++
+
+			// Get message timestamp
+			timestamp := time.Time{}
+			if ts := msg.Message.GetMessageTimestamp(); ts != 0 {
+				timestamp = time.Unix(int64(ts), 0).UTC()
+			} else {
+				result.Skipped++
+				continue
+			}
+			if result.OldestTimestamp.IsZero() || timestamp.Before(result.OldestTimestamp) {
+				result.OldestTimestamp = timestamp
+			}
+
+			// Unwrap like live events, then extract content and media info
+			unwrapped := unwrapMessage(msg.Message.Message)
+			content := extractTextContent(unwrapped)
+			mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(unwrapped)
+
+			// Log the message content for debugging
+			logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+
+			// Skip messages with no content and no media
+			if content == "" && mediaType == "" {
+				result.Skipped++
+				continue
+			}
+
+			isFromMe := msg.Message.GetKey().GetFromMe()
+			sender := historyMessageSender(msg.Message.GetKey().GetParticipant(), isFromMe, jid, ownUser, logger)
+
+			// Store message
+			msgID := msg.Message.GetKey().GetID()
+
+			existed, err := messageStore.StoreMessage(
+				msgID,
+				chatJID,
+				sender,
+				content,
+				timestamp,
+				isFromMe,
+				mediaType,
+				filename,
+				url,
+				mediaKey,
+				fileSHA256,
+				fileEncSHA256,
+				fileLength,
+			)
+			if err != nil {
+				logger.Warnf("Failed to store history message: %v", err)
+				continue
+			}
+			syncedCount++
+			if existed {
+				result.StoredExisting++
+			} else {
+				result.StoredNew++
+			}
+			if oldestStored.IsZero() || timestamp.Before(oldestStored) {
+				oldestStored = timestamp
+				result.OldestStoredID = msgID
+			}
+			// Log successful message storage
+			if mediaType != "" {
+				logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
+					timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
+			} else {
+				logger.Infof("Stored message: [%s] %s -> %s: %s",
+					timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
+			}
+		}
+		results = append(results, result)
 	}
 
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	return results
 }
 
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+// pendingHistoryRequest is the one on-demand history request waiting for its answer.
+type pendingHistoryRequest struct {
+	chatJID   string
+	requestID string             // id of the sent request message; "" while sending
+	done      chan historyAnswer // buffered; receives the matching answer once
+	// early holds ON_DEMAND answers that carried an original message id and arrived
+	// while requestID was still unknown, keyed by that id; setRequestID completes the
+	// request from here if one of them answers it.
+	early map[string]historyAnswer
+}
+
+// historyRequestRegistry holds at most one pending on-demand history request and
+// completes it when the matching ON_DEMAND history sync has been stored.
+type historyRequestRegistry struct {
+	mu      sync.Mutex
+	pending *pendingHistoryRequest
+}
+
+// historyRequests is the registry shared by the REST handler and the event handler.
+var historyRequests = &historyRequestRegistry{}
+
+// begin registers a new pending request for chatJID. ok is false when another
+// request is already pending.
+func (r *historyRequestRegistry) begin(chatJID string) (p *pendingHistoryRequest, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pending != nil {
+		return nil, false
+	}
+	r.pending = &pendingHistoryRequest{chatJID: chatJID, done: make(chan historyAnswer, 1), early: map[string]historyAnswer{}}
+	return r.pending, true
+}
+
+// setRequestID records the id of the sent request message on p, and completes p if
+// its answer already arrived while the send was in progress.
+func (r *historyRequestRegistry) setRequestID(p *pendingHistoryRequest, requestID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p.requestID = requestID
+	if answer, ok := p.early[requestID]; ok && r.pending == p {
+		p.done <- answer
+		r.pending = nil
+	}
+}
+
+// finish removes p if it is still the pending request (after a timeout or send failure).
+func (r *historyRequestRegistry) finish(p *pendingHistoryRequest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pending == p {
+		r.pending = nil
+	}
+}
+
+// offer completes the pending request if historySync is an ON_DEMAND sync that
+// answers it (design Decision 2). A sync that carries an original message id matches
+// only when that id equals the request id; if the request id is not known yet because
+// the send has not returned, the answer is held until setRequestID decides. A sync
+// with no original message id matches when it holds a conversation for the pending
+// chat. Anything else, including every non-ON_DEMAND sync, is ignored here.
+func (r *historyRequestRegistry) offer(historySync *events.HistorySync, results []conversationResult) {
+	if historySync.Data.GetSyncType() != waHistorySync.HistorySync_ON_DEMAND {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p := r.pending
+	if p == nil {
 		return
 	}
 
-	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
+	answer := historyAnswer{Result: conversationResult{ChatJID: p.chatJID}}
+	for _, res := range results {
+		answer.Conversations = append(answer.Conversations, res.ChatJID)
+		if res.ChatJID == p.chatJID && !answer.ChatFound {
+			answer.Result, answer.ChatFound = res, true
+		}
+	}
+
+	originalID := historySync.Notification.GetOriginalMessageID()
+	switch {
+	case originalID != "" && p.requestID == "":
+		p.early[originalID] = answer
+		return
+	case originalID != "":
+		if originalID != p.requestID {
+			return
+		}
+	case !answer.ChatFound:
 		return
 	}
-
-	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
-	}
-
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
-	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
-	}
+	p.done <- answer
+	r.pending = nil
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file
