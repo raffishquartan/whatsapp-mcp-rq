@@ -57,6 +57,14 @@ The endpoint SHALL report bridge state and send failures as structured errors an
 - **WHEN** sending the peer message returns an error
 - **THEN** the bridge responds 502 with the error text
 
+#### Scenario: Answer without the requested chat
+- **WHEN** the on-demand history sync that matches the request id holds no conversation for `chat_jid` (for example the phone answered under another JID for the chat)
+- **THEN** the bridge stores what the answer holds and responds 502 with `reason: "chat_not_in_answer"`, the `request_id`, and the conversation JIDs the answer held; it does not report the start of the chat
+
+#### Scenario: Late answer to an earlier request
+- **WHEN** an on-demand history sync carrying another request's original message id arrives while a request is pending, including while that request is still being sent
+- **THEN** the bridge stores it and does not complete the pending request with it
+
 #### Scenario: Phone does not answer in time
 - **WHEN** no matching on-demand history sync arrives within the wait timeout (default 60 seconds)
 - **THEN** the bridge responds 504 with the request id, and still stores the answer if it arrives later
@@ -69,11 +77,15 @@ A successful response SHALL report what the phone returned and what changed in `
 - **THEN** the response contains `request_id`, `received` (messages in the answer for that chat), `stored_new` (rows that did not exist before), `stored_existing` (rows that already existed and were rewritten), `skipped` (messages with no text and no media), `oldest_timestamp` (UTC, RFC 3339) of the answer, and `next_before_message_id` (the oldest stored message from the answer, or null when the answer stored nothing)
 
 #### Scenario: Start of chat reached
-- **WHEN** the phone returns no messages older than the anchor
+- **WHEN** the matching answer holds the chat's conversation with no messages older than the anchor
 - **THEN** the response has `received: 0` and `next_before_message_id: null`
 
+#### Scenario: Answer with nothing storable
+- **WHEN** the matching answer holds messages for the chat but none of them can be stored (no text and no media, or no timestamp)
+- **THEN** the response has `received` greater than 0 and `next_before_message_id: null`
+
 ### Requirement: History sync storage is idempotent and does not regress chat metadata
-Storing messages from any history sync SHALL be idempotent on (`id`, `chat_jid`), and SHALL NOT move a chat's `last_message_time` earlier than its current value.
+Storing messages from any history sync SHALL be idempotent on (`id`, `chat_jid`), SHALL NOT move a chat's `last_message_time` earlier than its current value, SHALL record `sender` in the same form as live messages (the user part of the sender JID), and SHALL report a result for every conversation in the sync, including conversations with no messages.
 
 #### Scenario: Re-requesting the same page
 - **WHEN** the same page of history is requested twice
@@ -83,12 +95,20 @@ Storing messages from any history sync SHALL be idempotent on (`id`, `chat_jid`)
 - **WHEN** an on-demand answer contains only messages older than the chat's stored `last_message_time`
 - **THEN** `chats.last_message_time` keeps its previous value
 
+#### Scenario: Sender form matches live messages
+- **WHEN** a history-sync message from a group participant (a phone-number or LID JID, possibly with a device) is stored
+- **THEN** `messages.sender` holds the participant's user part, as the live message handler stores it
+
+#### Scenario: Concurrent live and history writes
+- **WHEN** live messages and history-sync messages are stored at the same time
+- **THEN** no write fails because the database is locked
+
 ### Requirement: Bulk backfill procedure
-The project SHALL provide a backfill command that requests history for every chat with at least one stored message on or after a given `--since` date (UTC), excluding broadcast chats, reading `messages.db` read-only for its chat list and its before/after counts. For each chat it SHALL page backwards from the newest stored message until the answer's oldest message is older than `--since`, the start of the chat is reached, or a per-chat page cap is hit.
+The project SHALL provide a backfill command that requests history for every chat with at least one stored message on or after a given `--since` date (UTC), excluding broadcast chats, reading `messages.db` read-only for its chat list and its before/after counts. For each chat it SHALL page backwards from the newest stored message until the answer's oldest message is older than `--since`, the answer for the chat is empty (start of chat), or a per-chat page cap is hit. An answer that cannot be paged from (messages but no stored anchor) or that does not hold the chat SHALL stop the chat without marking it complete.
 
 #### Scenario: Full run
-- **WHEN** the owner runs the command with `--since 2026-11-01` and every request succeeds
-- **THEN** every non-broadcast chat with messages since 2026-11-01 is processed, and a report lists, per chat, the message counts in the window before and after, the new message ids and timestamps, pages requested and the stop reason
+- **WHEN** the owner runs the command with `--since <date>` and every request succeeds
+- **THEN** every non-broadcast chat with messages since that date is processed, and a report lists, per chat, the message counts in the window before and after, the new message ids and timestamps, pages requested and the stop reason
 
 #### Scenario: Pacing and budget
 - **WHEN** the command runs
@@ -100,7 +120,15 @@ The project SHALL provide a backfill command that requests history for every cha
 
 #### Scenario: Resume after interruption
 - **WHEN** the command is rerun with the same progress file after an interrupted run
-- **THEN** chats already marked complete are skipped and the remaining chats are processed
+- **THEN** chats already marked complete (reached since, start of chat, or unknown anchor) are skipped and every other chat resumes from the anchor it stopped at
+
+#### Scenario: Inconclusive answer
+- **WHEN** an answer has `received` greater than 0 and `next_before_message_id: null`, or the bridge responds 502 with `reason: "chat_not_in_answer"`
+- **THEN** the chat is listed as not reaching `--since` with its own stop reason (never "start of chat"), and a rerun requests it again
+
+#### Scenario: Page cap raised on rerun
+- **WHEN** a chat stopped at the page cap and the command is rerun with a higher `--max-pages-per-chat`
+- **THEN** the chat continues from its last anchor, and its page count is a total across runs
 
 #### Scenario: Dry run
 - **WHEN** the command runs with `--dry-run`

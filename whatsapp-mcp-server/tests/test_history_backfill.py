@@ -89,6 +89,11 @@ def err(status: int, message: str = "boom") -> Response:
     return status, {"success": False, "message": message}
 
 
+def chat_not_in_answer() -> Response:
+    return 502, {"success": False, "message": "answer to request REQ held no conversation for chat",
+                 "request_id": "REQ", "reason": "chat_not_in_answer"}
+
+
 class FakeBridge:
     """Scripted bridge: per chat, a queue of responses; records every request body."""
 
@@ -241,7 +246,10 @@ def test_paging_follows_next_id_until_since(db: Path, tmp_path: Path) -> None:
     ("response", "reason", "exit_code"),
     [
         (ok(0, None, None), hb.StopReason.START_OF_CHAT, 0),
-        (ok(3, "2026-11-02T12:00:00Z", None), hb.StopReason.START_OF_CHAT, 0),
+        (ok(3, "2026-11-02T12:00:00Z", None), hb.StopReason.UNANCHORED_ANSWER, 1),
+        (ok(3, None, None), hb.StopReason.UNANCHORED_ANSWER, 1),
+        (ok(3, "2026-10-30T12:00:00Z", None), hb.StopReason.REACHED_SINCE, 0),
+        (chat_not_in_answer(), hb.StopReason.CHAT_NOT_IN_ANSWER, 1),
         (err(404, "message g1-b is not stored"), hb.StopReason.NO_ANCHOR, 1),
     ],
 )
@@ -505,3 +513,86 @@ def test_http_poster_non_json_body(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(requests, "post", fake_post)
     assert hb.http_poster("http://127.0.0.1:9/api")({}) == (404, {"message": "404 page not found"})
+
+
+# --- review fixes: resumable stop reasons, error branches, --db default ---
+
+
+@pytest.mark.parametrize(
+    "response", [ok(3, "2026-11-02T12:00:00Z", None), chat_not_in_answer()], ids=["unanchored", "chat-not-in-answer"]
+)
+def test_inconclusive_answers_are_retried_on_rerun(db: Path, tmp_path: Path, response: Response) -> None:
+    config = make_config(db, tmp_path, "--only", "group1@g.us")
+    first = run(config, FakeBridge({"group1@g.us": [response]}))
+    assert first.results[0].stop is not hb.StopReason.START_OF_CHAT
+    assert "group1@g.us" in (tmp_path / "out" / "report.md").read_text().split("Chats not reaching since:")[1]
+
+    bridge = FakeBridge({}, default=ok(0, None, None))
+    second = run(config, bridge)
+    assert bridge.calls == [{"chat_jid": "group1@g.us", "count": 50, "before_message_id": "g1-b"}]
+    assert second.results[0].stop is hb.StopReason.START_OF_CHAT
+
+
+def test_chat_not_in_answer_counts_towards_abort(db: Path, tmp_path: Path) -> None:
+    outcome = run(make_config(db, tmp_path), FakeBridge({}, default=chat_not_in_answer()))
+    assert outcome.aborted
+    assert [r.stop for r in outcome.results] == [hb.StopReason.CHAT_NOT_IN_ANSWER] * 3
+
+
+def test_page_cap_resumes_from_last_anchor_with_higher_cap(db: Path, tmp_path: Path) -> None:
+    config = make_config(db, tmp_path, "--only", "group1@g.us", "--max-pages-per-chat", "2")
+    run(config, FakeBridge({"group1@g.us": [ok(50, "2026-11-04T00:00:00Z", "p1"),
+                                             ok(50, "2026-11-03T00:00:00Z", "p2")]}))
+
+    same_cap = FakeBridge({})
+    outcome = run(config, same_cap)
+    assert same_cap.calls == []
+    assert outcome.results[0].stop is hb.StopReason.PAGE_CAP
+
+    bridge = FakeBridge({"group1@g.us": [ok(50, "2026-10-30T00:00:00Z", "p3")]})
+    outcome = run(replace(config, max_pages_per_chat=3), bridge)
+    assert bridge.calls == [{"chat_jid": "group1@g.us", "count": 50, "before_message_id": "p2"}]
+    result = outcome.results[0]
+    assert result.stop is hb.StopReason.REACHED_SINCE
+    assert (result.pages, result.requests, result.received) == (3, 3, 150)
+    assert outcome.exit_code == 0
+
+
+def test_budget_resumes_from_last_anchor(db: Path, tmp_path: Path) -> None:
+    config = make_config(db, tmp_path, "--only", "group1@g.us", "--budget", "1")
+    first = run(config, FakeBridge({"group1@g.us": [ok(50, "2026-11-04T00:00:00Z", "p1")]}))
+    assert first.results[0].stop is hb.StopReason.BUDGET
+
+    bridge = FakeBridge({}, default=ok(0, None, None))
+    run(replace(config, budget=150), bridge)
+    assert bridge.calls == [{"chat_jid": "group1@g.us", "count": 50, "before_message_id": "p1"}]
+
+
+def test_409_with_budget_exhausted_stops_with_budget(db: Path, tmp_path: Path) -> None:
+    config = make_config(db, tmp_path, "--only", "group1@g.us", "--budget", "1")
+    bridge = FakeBridge({"group1@g.us": [err(409)]})
+    outcome = run(config, bridge)
+    assert len(bridge.calls) == 1
+    assert outcome.results[0].stop is hb.StopReason.BUDGET
+    assert outcome.budget_exhausted
+
+
+@pytest.mark.parametrize("content", ["not json", "{}", '{"since": "2026-11-01", "before": {}, "chats": {"x": {}}}'])
+def test_corrupt_progress_file_exits_2(db: Path, tmp_path: Path, content: str) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "progress.json").write_text(content)
+    assert hb.main(["--since", SINCE, "--db", str(db), "--out", str(out), "--only", "group1@g.us"]) == 2
+
+
+def test_missing_db_exits_2_and_names_flag(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    code = hb.main(["--since", SINCE, "--db", str(tmp_path / "missing.db"), "--out", str(tmp_path / "out"), "--dry-run"])
+    assert code == 2
+    assert "--db" in caplog.text
+
+
+def test_db_default_is_shown_in_help(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit):
+        hb.parse_args(["--help"])
+    db_help = capsys.readouterr().out.split("--db DB")[-1].split("--bridge-url")[0]
+    assert "default:" in db_help and "messages.db" in db_help

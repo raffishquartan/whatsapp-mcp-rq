@@ -13,7 +13,8 @@ Safety (each request is a peer message to the user's own phone):
   jitter between requests, and a hard `--budget` on the number of requests;
 - the run stops after 3 consecutive failed requests (404 is not a failure);
 - `messages.db` is opened read-only; only the bridge writes to it;
-- progress is saved after each chat, so a rerun skips completed chats.
+- progress is saved after each chat, so a rerun skips completed chats and resumes
+  the others from the anchor they stopped at.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ JITTER_MAX_SECONDS = 5.0
 DEFAULT_BUDGET = 150
 DEFAULT_MAX_PAGES_PER_CHAT = 10
 MAX_FAILURE_STREAK = 3
+CHAT_NOT_IN_ANSWER_REASON = "chat_not_in_answer"
 # The bridge waits up to 60 seconds for the phone; allow for that plus overhead.
 HTTP_TIMEOUT_SECONDS = 90.0
 JID_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+$")
@@ -68,12 +70,17 @@ class StopReason(enum.Enum):
     START_OF_CHAT = "start of chat"
     PAGE_CAP = "page cap"
     NO_ANCHOR = "no anchor"
+    # The answer held messages but none was stored, so there is no anchor for the next page.
+    UNANCHORED_ANSWER = "no stored message in answer"
+    # The answer to the request held no conversation for the chat (bridge 502, reason chat_not_in_answer).
+    CHAT_NOT_IN_ANSWER = "chat not in answer"
     BUDGET = "budget exhausted"
     FAILED = "failed"
 
 
-# A chat with one of these stop reasons is not requested again on a rerun.
-COMPLETE_REASONS = frozenset({StopReason.REACHED_SINCE, StopReason.START_OF_CHAT, StopReason.PAGE_CAP, StopReason.NO_ANCHOR})
+# A chat with one of these stop reasons is not requested again on a rerun. Every other
+# chat is resumed from its ChatResult.next_anchor.
+COMPLETE_REASONS = frozenset({StopReason.REACHED_SINCE, StopReason.START_OF_CHAT, StopReason.NO_ANCHOR})
 # A chat with one of these stop reasons is known to be complete back to --since.
 COVERED_REASONS = frozenset({StopReason.REACHED_SINCE, StopReason.START_OF_CHAT})
 
@@ -114,6 +121,8 @@ class ChatResult:
     stored_new: int
     stored_existing: int
     errors: tuple[str, ...]
+    # Anchor (before_message_id) a rerun resumes from; counts above are totals across runs.
+    next_anchor: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--since", required=True, type=_since_date, help="window start, ISO date (UTC), e.g. 2026-11-01")
     parser.add_argument("--out", required=True, type=Path, help="directory for report.md, report.csv and progress.json")
-    parser.add_argument("--db", type=Path, default=Path(MESSAGES_DB_PATH), help="messages.db path (opened read-only)")
+    parser.add_argument("--db", type=Path, default=Path(MESSAGES_DB_PATH).resolve(),
+                        help="messages.db path, opened read-only (default: %(default)s, the bridge store next to "
+                        "this checkout's whatsapp-mcp-server; pass --db when the command is installed elsewhere)")
     parser.add_argument("--bridge-url", default=WHATSAPP_API_BASE_URL, help="bridge REST API base URL (default: %(default)s)")
     parser.add_argument("--only", action="append", type=_chat_jid, default=[], metavar="JID",
                         help="process only this chat; repeat for several")
@@ -237,7 +248,7 @@ def snapshot_window(db: Path, since: datetime, jids: Sequence[str] | None = None
     try:
         conn = open_readonly(db)
     except sqlite3.Error as exc:
-        raise BackfillError(f"cannot open {db} read-only: {exc}") from exc
+        raise BackfillError(f"cannot open {db} read-only: {exc}; pass --db with the bridge's messages.db") from exc
     try:
         rows: list[tuple[str, str, str, str]] = conn.execute(
             """SELECT m.chat_jid, COALESCE(c.name, ''), m.id, m.timestamp
@@ -358,6 +369,7 @@ class _Pacer:
 
 @dataclass(slots=True)
 class _ChatProgress:
+    anchor: str
     requests: int = 0
     pages: int = 0
     received: int = 0
@@ -365,9 +377,14 @@ class _ChatProgress:
     stored_existing: int = 0
     errors: list[str] = field(default_factory=list)
 
+    @classmethod
+    def resume(cls, previous: ChatResult) -> _ChatProgress:
+        return cls(previous.next_anchor, previous.requests, previous.pages, previous.received,
+                   previous.stored_new, previous.stored_existing, list(previous.errors))
+
     def result(self, jid: str, stop: StopReason) -> ChatResult:
         return ChatResult(jid, stop, self.requests, self.pages, self.received, self.stored_new,
-                          self.stored_existing, tuple(self.errors))
+                          self.stored_existing, tuple(self.errors), self.anchor)
 
 
 def _send(body: dict[str, object], post: PostFn, state: _RunState, pacer: _Pacer,
@@ -381,21 +398,24 @@ def _send(body: dict[str, object], post: PostFn, state: _RunState, pacer: _Pacer
         return 0, {"message": str(exc)}
 
 
-def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunState, pacer: _Pacer) -> ChatResult:
-    progress = _ChatProgress()
-    anchor = chat.newest_id
+def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunState, pacer: _Pacer,
+                  previous: ChatResult | None = None) -> ChatResult:
+    """Page backwards through one chat, from the newest stored message or, on a rerun,
+    from where the previous run stopped. Page and request counts are totals across runs,
+    so --max-pages-per-chat caps the chat as a whole."""
+    progress = _ChatProgress(chat.newest_id) if previous is None else _ChatProgress.resume(previous)
 
-    def fail(message: str) -> ChatResult:
+    def fail(message: str, stop: StopReason = StopReason.FAILED) -> ChatResult:
         progress.errors.append(message)
         state.failure_streak += 1
         if state.failure_streak >= MAX_FAILURE_STREAK:
             state.aborted = True
-        return progress.result(chat.jid, StopReason.FAILED)
+        return progress.result(chat.jid, stop)
 
     while True:
         if progress.pages >= config.max_pages_per_chat:
             return progress.result(chat.jid, StopReason.PAGE_CAP)
-        body: dict[str, object] = {"chat_jid": chat.jid, "count": PAGE_SIZE, "before_message_id": anchor}
+        body: dict[str, object] = {"chat_jid": chat.jid, "count": PAGE_SIZE, "before_message_id": progress.anchor}
         if state.requests_sent >= config.budget:
             state.budget_exhausted = True
             return progress.result(chat.jid, StopReason.BUDGET)
@@ -410,6 +430,8 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
         if status == 404:
             progress.errors.append(_error_text(status, payload))
             return progress.result(chat.jid, StopReason.NO_ANCHOR)
+        if status == 502 and payload.get("reason") == CHAT_NOT_IN_ANSWER_REASON:
+            return fail(_error_text(status, payload), StopReason.CHAT_NOT_IN_ANSWER)
         if status != 200:
             return fail(_error_text(status, payload))
         try:
@@ -426,9 +448,13 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
                     page.stored_new, page.oldest_timestamp)
         if page.oldest_timestamp is not None and page.oldest_timestamp < config.since:
             return progress.result(chat.jid, StopReason.REACHED_SINCE)
-        if page.received == 0 or page.next_before_message_id is None:
+        if page.received == 0:
             return progress.result(chat.jid, StopReason.START_OF_CHAT)
-        anchor = page.next_before_message_id
+        if page.next_before_message_id is None:
+            progress.errors.append(f"answer held {page.received} messages but none was stored; "
+                                   f"no anchor for the next page")
+            return progress.result(chat.jid, StopReason.UNANCHORED_ANSWER)
+        progress.anchor = page.next_before_message_id
 
 
 # --- progress file ---
@@ -453,7 +479,7 @@ def _load_progress(config: Config) -> _Progress:
         before = {jid: ChatSnapshot(jid, s["name"], s["messages"], s["newest_id"], s["newest_timestamp"])
                   for jid, s in raw["before"].items()}
         results = {jid: ChatResult(jid, StopReason(r["stop"]), r["requests"], r["pages"], r["received"],
-                                   r["stored_new"], r["stored_existing"], tuple(r["errors"]))
+                                   r["stored_new"], r["stored_existing"], tuple(r["errors"]), r["next_anchor"])
                    for jid, r in raw["chats"].items()}
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise BackfillError(f"cannot read progress file {config.progress}: {exc}") from exc
@@ -600,7 +626,7 @@ def run_backfill(config: Config, post: PostFn, sleep: SleepFn, jitter: JitterFn)
             state.budget_exhausted = True
         if state.aborted or state.budget_exhausted:
             break
-        progress.results[chat.jid] = backfill_chat(chat, config, post, state, pacer)
+        progress.results[chat.jid] = backfill_chat(chat, config, post, state, pacer, previous)
         _save_progress(config.progress, progress)
 
     after = snapshot_window(config.db, config.since, [c.jid for c in chats])

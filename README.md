@@ -192,7 +192,7 @@ Successful response (200):
 ```
 
 - `received`: messages in the answer for the chat; `stored_new`: rows that were not in `messages.db`; `stored_existing`: rows that were already there and were rewritten; `skipped`: messages with no text and no media.
-- `next_before_message_id` is the oldest stored message from the answer: pass it as `before_message_id` to get the next older page. It is `null` (with `received: 0`) at the start of the chat.
+- `next_before_message_id` is the oldest stored message from the answer: pass it as `before_message_id` to get the next older page. It is `null` whenever the answer stored nothing: at the start of the chat (`received: 0`), and also when the answer held messages but none could be stored (`received` > 0, every message skipped). Only `received: 0` means the start of the chat; with `received` > 0 and a `null` next id there is no anchor to page further from.
 - Storage is idempotent, so overlapping pages are harmless, and an older page never moves a chat's last-message time backwards.
 
 Errors return `{"success": false, "message": "..."}` and send nothing to WhatsApp unless noted:
@@ -203,7 +203,7 @@ Errors return `{"success": false, "message": "..."}` and send nothing to WhatsAp
 | 404 | No stored message in the chat to anchor on, or `before_message_id` not stored for the chat |
 | 405 | Method other than POST |
 | 409 | Another history request is still waiting for its answer |
-| 502 | Sending the request to the phone failed (message has the error) |
+| 502 | Sending the request to the phone failed (message has the error); or the phone's answer to this request held no conversation for `chat_jid` (body has `"reason": "chat_not_in_answer"`, `request_id`, and the conversations the answer did hold). The latter says nothing about the chat's history; it is not the start of the chat |
 | 503 | Bridge not connected or not logged in |
 | 504 | No answer within 60 seconds (body includes `request_id`); a late answer is still stored |
 
@@ -228,9 +228,9 @@ What it does:
 
 1. Snapshots, from `messages.db` opened read-only, every non-broadcast chat with a message on or after `--since` (UTC), with the ids of its messages in that window.
 2. Orders the chats: `--canary` first, then groups, then direct chats, each most recently active first.
-3. For each chat, requests 50 messages before the chat's newest stored message, then follows `next_before_message_id` until the answer's oldest message is older than `--since` ("reached since"), the start of the chat is reached ("start of chat"), or `--max-pages-per-chat` is hit ("page cap").
+3. For each chat, requests 50 messages before the chat's newest stored message, then follows `next_before_message_id` until the answer's oldest message is older than `--since` ("reached since"), the answer for the chat is empty ("start of chat"), or `--max-pages-per-chat` is hit ("page cap"). Two inconclusive answers also stop the chat without claiming coverage: an answer with messages but nothing stored, so no next anchor ("no stored message in answer"), and a 502 `chat_not_in_answer` ("chat not in answer", counted as a failure).
 4. Paces requests: one at a time, at least `--delay` seconds plus 0-5 seconds of random jitter apart, never more than `--budget` requests in total. A 409 waits and retries once; a 504 or other failure moves on to the next chat; three consecutive failures (404 does not count) abort the run.
-5. Saves progress after each chat to `--progress`; rerunning with the same file skips completed chats and retries failed ones.
+5. Saves progress after each chat to `--progress`; rerunning with the same file skips chats that are complete ("reached since", "start of chat", or a 404 "no anchor") and resumes every other chat from the anchor it stopped at. Page and request counts are totals across runs, so a chat that hit the page cap continues only when rerun with a higher `--max-pages-per-chat`.
 6. Re-snapshots and writes `report.md` and `report.csv` to `--out`: per chat, the window counts before and after, the new message ids and timestamps (never message content), pages, stop reason, newest stored timestamp and errors, plus a summary listing any chat that did not reach `--since`.
 
 Exit status: 0 when every chat reached `--since` or its start; 1 when the run aborted, ran out of budget, or any chat stopped for another reason; 2 for invalid input (including a selection with no chats).
@@ -239,13 +239,13 @@ Exit status: 0 when every chat reached `--since` or its start; 1 when the run ab
 |---|---|---|
 | `--since DATE` | required | Window start, ISO date in UTC (`YYYY-MM-DD`) |
 | `--out DIR` | required | Directory for `report.md`, `report.csv` and `progress.json`; keep it outside the repository |
-| `--db PATH` | `whatsapp-bridge/store/messages.db` | Database to read (read-only) |
+| `--db PATH` | `whatsapp-bridge/store/messages.db` of this checkout | Database to read (read-only). The default is resolved from the location of `whatsapp-mcp-server/whatsapp.py`, so it is right for `uv run` in this checkout; pass `--db` if the command is installed elsewhere. `--help` prints the resolved default |
 | `--bridge-url URL` | `http://localhost:8080/api` | Bridge REST API base URL |
 | `--only JID` | all chats | Process only this chat; repeat for several |
 | `--canary JID` | none | Process this chat first (ignored with a warning if it has no messages in the window) |
 | `--delay SECONDS` | 10 | Minimum gap between requests, plus 0-5 s jitter |
 | `--budget N` | 150 | Maximum requests in this run |
-| `--max-pages-per-chat N` | 10 | Maximum pages of 50 messages per chat |
+| `--max-pages-per-chat N` | 10 | Maximum pages of 50 messages per chat, counted across reruns |
 | `--progress PATH` | `OUT/progress.json` | Progress file used to resume |
 | `--dry-run` | off | List the chats and their current counts; send nothing |
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -270,9 +271,9 @@ func beginWithID(t *testing.T, reg *historyRequestRegistry, chatJID, requestID s
 func expectCompleted(t *testing.T, p *pendingHistoryRequest, wantChat string) {
 	t.Helper()
 	select {
-	case r := <-p.done:
-		if r.ChatJID != wantChat {
-			t.Errorf("completed with %+v, want chat %s", r, wantChat)
+	case a := <-p.done:
+		if a.Result.ChatJID != wantChat || !a.ChatFound {
+			t.Errorf("completed with %+v, want chat %s found", a, wantChat)
 		}
 	default:
 		t.Error("request not completed")
@@ -282,8 +283,8 @@ func expectCompleted(t *testing.T, p *pendingHistoryRequest, wantChat string) {
 func expectPending(t *testing.T, p *pendingHistoryRequest) {
 	t.Helper()
 	select {
-	case r := <-p.done:
-		t.Errorf("request completed unexpectedly with %+v", r)
+	case a := <-p.done:
+		t.Errorf("request completed unexpectedly with %+v", a)
 	default:
 	}
 }
@@ -292,11 +293,11 @@ func TestRegistryCompletesOnOriginalMessageID(t *testing.T) {
 	reg := &historyRequestRegistry{}
 	p := beginWithID(t, reg, "chat@g.us", "REQ1")
 	hs := historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1")
-	reg.offer(hs, nil)
+	reg.offer(hs, []conversationResult{{ChatJID: "chat@g.us"}})
 	select {
-	case r := <-p.done:
-		if r.ChatJID != "chat@g.us" || r.Received != 0 {
-			t.Errorf("start-of-chat result = %+v, want empty result for chat@g.us", r)
+	case a := <-p.done:
+		if a.Result.ChatJID != "chat@g.us" || a.Result.Received != 0 || !a.ChatFound {
+			t.Errorf("start-of-chat answer = %+v, want empty found result for chat@g.us", a)
 		}
 	default:
 		t.Fatal("request not completed by matching original message id")
@@ -533,7 +534,7 @@ func TestHistoryEndpointSecondRequestWhilePending(t *testing.T) {
 		t.Errorf("sent %d requests, want 1", n)
 	}
 
-	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1"))
+	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1", conversation("chat@g.us")))
 	if rec := waitResponse(t, first); rec.Code != http.StatusOK {
 		t.Errorf("first request status = %d, want 200", rec.Code)
 	}
@@ -642,7 +643,7 @@ func TestHistoryEndpointAnchorOnGivenMessageAndDefaultCount(t *testing.T) {
 		req.GetOnDemandMsgCount() != 50 {
 		t.Errorf("request = %v, want anchor on the given message with default count 50", req)
 	}
-	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1"))
+	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1", conversation("chat@g.us")))
 	waitResponse(t, pending)
 }
 
@@ -651,7 +652,7 @@ func TestHistoryEndpointStartOfChat(t *testing.T) {
 	storeText(t, f.store, "first", time.Unix(1700000100, 0), false)
 	pending := f.doAsync(`{"chat_jid":"chat@g.us"}`)
 	f.sender.waitSent(t)
-	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1"))
+	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1", conversation("chat@g.us")))
 
 	rec := waitResponse(t, pending)
 	if rec.Code != http.StatusOK {
@@ -663,5 +664,188 @@ func TestHistoryEndpointStartOfChat(t *testing.T) {
 	}
 	if _, present := body["next_before_message_id"]; !present {
 		t.Error("next_before_message_id missing, want explicit null")
+	}
+}
+
+// --- review fixes ---
+
+func TestStoreHistorySyncEmitsResultForEveryConversation(t *testing.T) {
+	store := newTestStore(t)
+	untimed := historyMsg("untimed", 0, false, textMsg("no time"))
+	untimed.Message.MessageTimestamp = nil
+	hs := historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "",
+		// messages[0] is nil: the rest must still be stored and the chat time is the newest timestamp.
+		conversation("chat@g.us", nil,
+			historyMsg("b", 1700000100, false, textMsg("b")),
+			historyMsg("a", 1700000600, false, textMsg("a"))),
+		// messages[0] has no timestamp.
+		conversation("second@g.us", untimed, historyMsg("c", 1700000200, false, textMsg("c"))),
+		// No messages at all (start of chat).
+		conversation("empty@g.us"),
+	)
+	results := storeSync(store, hs)
+	if len(results) != 3 {
+		t.Fatalf("got %d results, want 3: %+v", len(results), results)
+	}
+	if r := results[0]; r.ChatJID != "chat@g.us" || r.Received != 2 || r.StoredNew != 2 || r.OldestStoredID != "b" {
+		t.Errorf("chat@g.us result = %+v, want 2 received, 2 new, oldest b", r)
+	}
+	if got, want := storedChatTime(t, store, "chat@g.us"), "2023-11-14 22:23:20+00:00"; got != want {
+		t.Errorf("last_message_time = %q, want %q (newest message in the answer)", got, want)
+	}
+	if r := results[1]; r.ChatJID != "second@g.us" || r.Received != 2 || r.Skipped != 1 || r.StoredNew != 1 || r.OldestStoredID != "c" {
+		t.Errorf("second@g.us result = %+v, want 2 received, 1 skipped, 1 new, oldest c", r)
+	}
+	if r := results[2]; r.ChatJID != "empty@g.us" || r.Received != 0 || r.OldestStoredID != "" {
+		t.Errorf("empty@g.us result = %+v, want empty result", r)
+	}
+	if n := countMessages(t, store, "empty@g.us"); n != 0 {
+		t.Errorf("empty@g.us rows = %d, want 0", n)
+	}
+}
+
+func TestStoreHistorySyncSenderMatchesLiveRepresentation(t *testing.T) {
+	store := newTestStore(t)
+	withParticipant := func(id, participant string) *waHistorySync.HistorySyncMsg {
+		m := historyMsg(id, 1700000100, false, textMsg(id))
+		m.Message.Key.Participant = proto.String(participant)
+		return m
+	}
+	storeSync(store, historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "",
+		conversation("chat@g.us",
+			withParticipant("pn", "111:2@s.whatsapp.net"),
+			withParticipant("lid", "222@lid")),
+		conversation("333@s.whatsapp.net", historyMsg("dm", 1700000100, false, textMsg("dm")))))
+	for id, want := range map[string]string{"pn": "111", "lid": "222", "dm": "333"} {
+		if got := rawText(t, store, "SELECT sender FROM messages WHERE id = ?", id); got != want {
+			t.Errorf("sender of %s = %q, want %q (live handler stores Info.Sender.User)", id, got, want)
+		}
+	}
+}
+
+func TestSenderIDIsUserPart(t *testing.T) {
+	if got := senderID(types.NewJID("111", types.DefaultUserServer)); got != "111" {
+		t.Errorf("senderID = %q, want 111", got)
+	}
+}
+
+func TestStoreMessageConcurrentWritesDoNotFail(t *testing.T) {
+	store := newTestStore(t)
+	const writers = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*10)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				// Half the writes rewrite one shared row, so read-then-write transactions overlap.
+				id := "shared"
+				if i%2 == 0 {
+					id = fmt.Sprintf("w%d-%d", w, i)
+				}
+				if _, err := store.StoreMessage(id, "chat@g.us", "s", "x", time.Unix(1700000100, 0), false,
+					"", "", "", nil, nil, nil, 0); err != nil {
+					errs <- err
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent StoreMessage: %v", err)
+	}
+}
+
+func TestRegistryIDMatchWithoutChatConversationIsFlagged(t *testing.T) {
+	reg := &historyRequestRegistry{}
+	p := beginWithID(t, reg, "111@lid", "REQ1")
+	reg.offer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1"), onDemandResult("111@s.whatsapp.net"))
+	select {
+	case a := <-p.done:
+		if a.ChatFound {
+			t.Errorf("answer = %+v, want ChatFound false", a)
+		}
+		if len(a.Conversations) != 1 || a.Conversations[0] != "111@s.whatsapp.net" {
+			t.Errorf("conversations = %v, want [111@s.whatsapp.net]", a.Conversations)
+		}
+	default:
+		t.Fatal("request not completed by matching original message id")
+	}
+}
+
+func TestRegistryLateAnswerToEarlierRequestIgnoredBeforeRequestIDKnown(t *testing.T) {
+	reg := &historyRequestRegistry{}
+	p, ok := reg.begin("chat@g.us")
+	if !ok {
+		t.Fatal("begin: registry busy")
+	}
+	// A late answer to an earlier request for the same chat arrives while the send is in progress.
+	reg.offer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "OLD"), onDemandResult("chat@g.us"))
+	expectPending(t, p)
+	reg.setRequestID(p, "REQ1")
+	expectPending(t, p)
+	reg.offer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1"), onDemandResult("chat@g.us"))
+	expectCompleted(t, p, "chat@g.us")
+}
+
+func TestRegistryAnswerBeforeRequestIDKnownCompletesOnSetRequestID(t *testing.T) {
+	reg := &historyRequestRegistry{}
+	p, ok := reg.begin("chat@g.us")
+	if !ok {
+		t.Fatal("begin: registry busy")
+	}
+	reg.offer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1"), onDemandResult("chat@g.us"))
+	expectPending(t, p)
+	reg.setRequestID(p, "REQ1")
+	expectCompleted(t, p, "chat@g.us")
+	if _, ok := reg.begin("chat@g.us"); !ok {
+		t.Error("registry still busy after completion")
+	}
+}
+
+func TestHistoryEndpointAnswerWithoutChatConversation(t *testing.T) {
+	f := newHistoryFixture(t, 5*time.Second)
+	storeText(t, f.store, "m1", time.Unix(1700000100, 0), false)
+	pending := f.doAsync(`{"chat_jid":"chat@g.us"}`)
+	f.sender.waitSent(t)
+	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1",
+		conversation("other@g.us", historyMsg("o1", 1700000050, false, textMsg("o1")))))
+
+	body := expectError(t, waitResponse(t, pending), http.StatusBadGateway, "other@g.us")
+	if body["reason"] != historyReasonChatNotInAnswer || body["request_id"] != "REQ1" {
+		t.Errorf("body = %v, want reason %s and request_id REQ1", body, historyReasonChatNotInAnswer)
+	}
+	if _, ok := f.reg.begin("chat@g.us"); !ok {
+		t.Error("registry still busy")
+	}
+}
+
+func TestHistoryEndpointAnchorLookupFailure(t *testing.T) {
+	f := newHistoryFixture(t, time.Second)
+	f.store.Close()
+	expectError(t, f.do(http.MethodPost, `{"chat_jid":"chat@g.us"}`), http.StatusInternalServerError, "failed to read anchor")
+	if n := f.sender.sentCount(); n != 0 {
+		t.Errorf("sent %d requests, want 0", n)
+	}
+}
+
+func TestHistoryEndpointClientGoneAway(t *testing.T) {
+	f := newHistoryFixture(t, 5*time.Second)
+	storeText(t, f.store, "m1", time.Unix(1700000100, 0), false)
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/request_history_sync", strings.NewReader(`{"chat_jid":"chat@g.us"}`)).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		f.handler.ServeHTTP(rec, req)
+		ch <- rec
+	}()
+	f.sender.waitSent(t)
+	cancel()
+	expectError(t, waitResponse(t, ch), http.StatusGatewayTimeout, "client went away")
+	if _, ok := f.reg.begin("chat@g.us"); !ok {
+		t.Error("registry still busy after the client went away")
 	}
 }

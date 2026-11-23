@@ -4,8 +4,8 @@
 
 ## 1. Spike (time-boxed: 2 hours, 3 attempts over at least 2 days - design.md Decision 9)
 
-- [ ] 1.1 On a throwaway branch, add a minimal unauthenticated loopback route that builds `types.MessageInfo` from the oldest stored message of the expenses test group (`<test-group-jid>`), calls `client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(&info, 50))`, logs the `SendResponse.ID`, and in `handleHistorySync` logs `Data.GetSyncType()`, `Notification.GetOriginalMessageID()`, `Notification.GetPeerDataRequestSessionID()` and conversation IDs; verify by building with `go build ./...`
-- [ ] 1.2 Run the spike build locally against the real account (phone online), call the route for the expenses test group, one `@lid` direct chat and one other group; record in the session WORKLOG which correlation field is filled, whether LID chats answer, and whether any message dated 2026-04-28 to 2026-05-03 arrived
+- [ ] 1.1 On a throwaway branch, add a minimal unauthenticated loopback route that builds `types.MessageInfo` from the oldest stored message of the canary group (`<canary-group-jid>`), calls `client.SendPeerMessage(ctx, client.BuildHistorySyncRequest(&info, 50))`, logs the `SendResponse.ID`, and in `handleHistorySync` logs `Data.GetSyncType()`, `Notification.GetOriginalMessageID()`, `Notification.GetPeerDataRequestSessionID()` and conversation IDs; verify by building with `go build ./...`
+- [ ] 1.2 Run the spike build locally against the real account (phone online), call the route for the canary group, one `@lid` direct chat and one other group; record in the session WORKLOG which correlation field is filled, whether LID chats answer, what a start-of-chat answer looks like (empty conversation for the chat, or no conversation at all), and whether any message from the canary group's known gap arrived
 - [ ] 1.3 Apply the Decision 9 outcome: proceed, ship as best effort, or stop and ask the owner before deleting; record the outcome in the WORKLOG; discard the spike branch
 
 ## 2. Store layer (Go)
@@ -48,7 +48,18 @@
 
 ## 8. Deployment and acceptance (after merge)
 
-- [ ] 8.1 Run `<claude-code-config-sync>/scripts/install-whatsapp-bridge.sh`; verify `INSTALLED_COMMIT_HASH` matches the merge commit and a POST with an empty body returns 400
-- [ ] 8.2 Back up `messages.db`, then run the canary `whatsapp-history-backfill --only <test-group-jid> --since 2026-04-01 --out <session>/working/backfill-canary`; verify the report shows new messages dated 2026-04-28 to 2026-05-03, or record evidence that they cannot be retrieved
-- [ ] 8.3 Run the expense-reconciliation Step 0 ban-report web search, then `whatsapp-history-backfill --since 2026-11-01 --canary <test-group-jid> --out <session>/working/backfill-2026-11-01`; verify the report lists all 51 non-broadcast chats, each with stop reason "reached since" or "start of chat", and share the summary with the owner
-- [ ] 8.4 Send a ccmsg to `claude-code-config-sync` with the outcome and the new invocation for expense-reconciliation Step 1a (POST endpoint or backfill command); verify with `ccmsg list` showing it sent
+- [ ] 8.1 Run the owner's bridge install script; verify `INSTALLED_COMMIT_HASH` matches the merge commit and a POST with an empty body returns 400
+- [ ] 8.2 Back up `messages.db`, then run the canary `whatsapp-history-backfill --only <canary-group-jid> --since <date before the gap> --out <working-dir>/backfill-canary`; verify the report shows new messages from the known gap, or record evidence that they cannot be retrieved
+- [ ] 8.3 Search for recent ban reports, then `whatsapp-history-backfill --since <window-start> --canary <canary-group-jid> --out <working-dir>/backfill`; verify the report lists every non-broadcast chat in the window (count from `--dry-run`), each with stop reason "reached since" or "start of chat", and share the summary with the owner
+- [ ] 8.4 Hand the outcome and the new invocation (POST endpoint or backfill command) to the owner's downstream workflow; verify the handoff was sent
+
+## 9. Review fixes (PR #12)
+
+- [x] 9.1 Bridge: emit a result for every conversation (newest timestamp for the chat row, no `messages[0]` dependence); an id-matched answer without the pending chat responds 502 `chat_not_in_answer`; verify with Go tests for nil/untimestamped first messages, an empty conversation, and the 502
+- [x] 9.2 Bridge: hold answers that carry an original message id while the request id is unknown, and complete only on a matching id; verify with Go tests for a late answer to an earlier request and an answer that arrives before the send returns
+- [x] 9.3 Bridge: record history `sender` with the live handler's `senderID` helper (user part); verify with a Go test for phone-number, LID and direct-chat senders
+- [x] 9.4 Bridge: `_txlock=immediate` and `_busy_timeout` in the DSN; verify with a concurrent `StoreMessage` Go test that fails without it
+- [x] 9.5 Bridge tests for the anchor lookup 500 and the client-gone 504 (registry cleared)
+- [x] 9.6 Backfill: new stop reasons "no stored message in answer" and "chat not in answer" (not complete, not covered); page cap and budget resume from the recorded anchor with counts carried across runs; verify with pytest for each, plus 409 with the budget exhausted and a corrupt progress file exiting 2
+- [x] 9.7 Backfill `--db`: show the resolved default in `--help`, name `--db` in the missing-database error, document in README; verify with pytest
+- [x] 9.8 README: `next_before_message_id` null semantics, 502 `chat_not_in_answer`, resume rules; change docs generalised to omit facts about the private message store
