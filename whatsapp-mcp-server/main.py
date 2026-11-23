@@ -44,8 +44,8 @@ def list_messages(
     """Get WhatsApp messages matching specified criteria with optional context.
     
     Args:
-        after: Optional ISO-8601 formatted string to only return messages after this date
-        before: Optional ISO-8601 formatted string to only return messages before this date
+        after: Optional ISO-8601 string; only messages after this instant are returned
+        before: Optional ISO-8601 string; only messages before this instant are returned
         sender_phone_number: Optional phone number to filter messages by sender
         chat_jid: Optional chat JID to filter messages by chat
         query: Optional search term to filter messages by content
@@ -54,6 +54,12 @@ def list_messages(
         include_context: Whether to include messages before and after matches (default True)
         context_before: Number of messages to include before each match (default 1)
         context_after: Number of messages to include after each match (default 1)
+
+    Times: `after`/`before` without an offset are UK local time (Europe/London);
+    an explicit offset such as +00:00 is honoured. An ambiguous autumn local time
+    means the first (BST) occurrence; a spring-gap local time is read as GMT.
+    Message timestamps in the output are Europe/London with their offset, e.g.
+    "2026-07-03 10:49:42+01:00".
     """
     messages = whatsapp_list_messages(
         after=after,
