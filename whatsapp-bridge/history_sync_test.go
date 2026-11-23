@@ -26,7 +26,15 @@ import (
 // storeText stores a plain text message in chat@g.us and returns whether the row already existed.
 func storeText(t *testing.T, store *MessageStore, id string, ts time.Time, fromMe bool) bool {
 	t.Helper()
-	existed, err := store.StoreMessage(id, "chat@g.us", "sender", "text "+id, ts, fromMe,
+	return storeTextIn(t, store, id, "chat@g.us", ts, fromMe)
+}
+
+func storeTextIn(t *testing.T, store *MessageStore, id, chatJID string, ts time.Time, fromMe bool) bool {
+	t.Helper()
+	if err := store.StoreChat(chatJID, "chat", ts); err != nil {
+		t.Fatalf("StoreChat(%s): %v", chatJID, err)
+	}
+	existed, err := store.StoreMessage(id, chatJID, "sender", "text "+id, ts, fromMe,
 		"", "", "", nil, nil, nil, 0)
 	if err != nil {
 		t.Fatalf("StoreMessage(%s): %v", id, err)
@@ -345,6 +353,10 @@ type fakeSender struct {
 	// blockSend makes SendPeerMessage wait for its context to end, like a send whose
 	// server acknowledgement never arrives.
 	blockSend bool
+	// pn is what PhoneJIDForLID returns (the zero JID is "no phone number known"), and
+	// lidErr the error it returns instead.
+	pn     types.JID
+	lidErr error
 
 	mu     sync.Mutex
 	sent   []*waE2E.Message
@@ -357,6 +369,10 @@ func newFakeSender() *fakeSender {
 
 func (f *fakeSender) IsConnected() bool { return f.connected }
 func (f *fakeSender) HasDeviceID() bool { return f.loggedIn }
+
+func (f *fakeSender) PhoneJIDForLID(ctx context.Context, lid types.JID) (types.JID, error) {
+	return f.pn, f.lidErr
+}
 
 // BuildHistorySyncRequest uses whatsmeow's real builder, which reads no client state.
 func (f *fakeSender) BuildHistorySyncRequest(info *types.MessageInfo, count int) *waE2E.Message {
@@ -907,5 +923,62 @@ func TestHistoryEndpointClientGoneAway(t *testing.T) {
 	expectError(t, waitResponse(t, ch), http.StatusGatewayTimeout, "client went away")
 	if _, ok := f.reg.begin("chat@g.us"); !ok {
 		t.Error("registry still busy after the client went away")
+	}
+}
+
+func TestHistoryEndpointLIDChatRequestedByPhoneNumberJID(t *testing.T) {
+	f := newHistoryFixture(t, 5*time.Second)
+	f.sender.pn = types.NewJID("447700900123", types.DefaultUserServer)
+	storeTextIn(t, f.store, "lid-anchor", "123456789@lid", time.Unix(1700000200, 0), false)
+
+	pending := f.doAsync(`{"chat_jid":"123456789@lid"}`)
+	req := onDemandRequest(t, f.sender.waitSent(t))
+	if req.GetChatJID() != "447700900123@s.whatsapp.net" || req.GetOldestMsgID() != "lid-anchor" {
+		t.Errorf("request = %v, want the phone-number JID anchored on the LID chat's oldest message", req)
+	}
+	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1",
+		conversation("447700900123@s.whatsapp.net", historyMsg("h1", 1700000100, false, textMsg("hi")))))
+	if rec := waitResponse(t, pending); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHistoryEndpointLIDChatFallsBackToLID(t *testing.T) {
+	cases := map[string]func(*fakeSender){
+		"no phone number known": func(s *fakeSender) {},
+		"lookup error":          func(s *fakeSender) { s.lidErr = errors.New("store down") },
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newHistoryFixture(t, 50*time.Millisecond)
+			setup(f.sender)
+			storeTextIn(t, f.store, "lid-anchor", "123456789@lid", time.Unix(1700000200, 0), false)
+
+			pending := f.doAsync(`{"chat_jid":"123456789@lid"}`)
+			req := onDemandRequest(t, f.sender.waitSent(t))
+			if req.GetChatJID() != "123456789@lid" {
+				t.Errorf("request chat = %q, want the LID", req.GetChatJID())
+			}
+			waitResponse(t, pending)
+		})
+	}
+}
+
+func TestRegistryAliasConversationAnswersRequest(t *testing.T) {
+	reg := &historyRequestRegistry{}
+	p, ok := reg.begin("123456789@lid", "447700900123@s.whatsapp.net")
+	if !ok {
+		t.Fatal("begin failed")
+	}
+	reg.setRequestID(p, "REQ1")
+	reg.offer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, ""),
+		[]conversationResult{{ChatJID: "447700900123@s.whatsapp.net", Received: 4}})
+	select {
+	case a := <-p.done:
+		if !a.ChatFound || a.Result.ChatJID != "447700900123@s.whatsapp.net" || a.Result.Received != 4 {
+			t.Errorf("answer = %+v, want the alias conversation found", a)
+		}
+	default:
+		t.Fatal("alias conversation did not complete the request")
 	}
 }

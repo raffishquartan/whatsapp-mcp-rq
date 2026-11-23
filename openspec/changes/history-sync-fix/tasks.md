@@ -19,7 +19,7 @@
 
 - [x] 3.1 Make `handleHistorySync` return per-conversation results (received, stored_new, stored_existing, skipped, oldest timestamp, oldest stored id) while keeping its current storage and logging behaviour; verify with a Go test feeding a constructed `events.HistorySync` with text, media, empty and nil messages
 - [x] 3.2 Add the pending-request registry (single in-flight entry, completion by original message id then chat JID, unsolicited syncs ignored); call it from `handleHistorySync` for `ON_DEMAND` syncs only; verify with Go tests for id match, chat fallback match, non-matching sync, and non-`ON_DEMAND` sync not completing the request
-- [ ] 3.3 If the spike showed LID chats need the phone-number JID, map via `client.Store.LIDs.GetPNForLID` before building the request and add a test with a fake LID store; otherwise mark this task not needed with the spike evidence
+- [x] 3.3 Spike evidence (real account, 2026-11-23): group requests are answered within about 13 seconds; three requests for a `@lid` direct chat, with the phone locked and unlocked, were sent but never answered (504). The handler now asks the LID store (`GetPNForLID`) for the phone-number JID of a `@lid` chat and builds the request with it, anchored on the LID chat's oldest stored message; a conversation under either JID answers the request, and the request falls back to the LID when no phone number is known or the lookup fails; verified with Go tests for the mapped request, both fallbacks and the alias answer. Whether the phone answers the mapped request, and under which JID it stores the messages, is unverified until a real-account run
 
 ## 4. Endpoint (Go)
 
@@ -82,3 +82,7 @@
 - [x] 11.1 Backfill: a 502 `chat_not_in_answer` is recorded per chat but neither increments nor resets the three-failure abort streak; verify with pytest (many such chats do not abort; the streak is unchanged by one)
 - [x] 11.2 Backfill: ten consecutive chats ending as `chat_not_in_answer` stop the run with their own report reason (a processed answer resets the count); verify with pytest for the cap, the reset and the unchanged failure-abort report
 - [x] 11.3 Backfill: the not-in-answer count is genuinely consecutive (any other chat outcome resets it), abort state has a single source of truth with a logged reason, the report wording is consistent, and the rerun behaviour is documented; verify with pytest (interleaved 404, failure, processed answer; abort on the last chat)
+
+## 12. LID mapping (patch release 0.2.1)
+
+- [x] 12.1 Bump `whatsapp-mcp-server` to 0.2.1 (`pyproject.toml`, `uv.lock`); verify `uv lock --check`
