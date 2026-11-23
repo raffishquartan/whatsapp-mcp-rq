@@ -126,9 +126,13 @@ The project SHALL provide a backfill command that requests history for every cha
 - **WHEN** three consecutive requests fail (any non-200 response other than 404 and other than the 502 `chat_not_in_answer`)
 - **THEN** the command stops sending, writes the report with the failures and exits non-zero
 
-#### Scenario: Chat not in answer does not abort the run
-- **WHEN** the bridge responds 502 with `reason: "chat_not_in_answer"` for several consecutive chats
+#### Scenario: Chat not in answer does not trigger the failure abort
+- **WHEN** the bridge responds 502 with `reason: "chat_not_in_answer"` for a few consecutive chats
 - **THEN** each chat is recorded as "chat not in answer" (not complete, not covered, retried on rerun), the failure streak is neither increased nor reset, and the run continues with the next chat
+
+#### Scenario: Many consecutive chats not in answer stop the run
+- **WHEN** ten consecutive chats end as "chat not in answer" (any other chat outcome in between, such as a processed answer, a 404 or a failure, resets the count)
+- **THEN** the command stops sending, writes the report naming this reason (not the failure streak) and exits non-zero
 
 #### Scenario: Resume after interruption
 - **WHEN** the command is rerun with the same progress file after an interrupted run

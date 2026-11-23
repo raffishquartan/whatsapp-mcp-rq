@@ -545,9 +545,8 @@ def test_inconclusive_answers_are_retried_on_rerun(db: Path, tmp_path: Path, res
     assert second.results[0].stop is hb.StopReason.START_OF_CHAT
 
 
-def test_chat_not_in_answer_does_not_count_towards_abort(db: Path, tmp_path: Path) -> None:
+def test_chat_not_in_answer_does_not_count_towards_failure_abort(db: Path, tmp_path: Path) -> None:
     outcome = run(make_config(db, tmp_path), FakeBridge({}, default=chat_not_in_answer()))
-    assert not outcome.aborted
     assert len(outcome.results) > hb.MAX_FAILURE_STREAK
     assert {r.stop for r in outcome.results} == {hb.StopReason.CHAT_NOT_IN_ANSWER}
 
@@ -561,6 +560,74 @@ def test_chat_not_in_answer_does_not_reset_failure_streak(db: Path, tmp_path: Pa
     hb.backfill_chat(chat, config, bridge, state, hb._Pacer(0.0, lambda _s: None, lambda: 0.0))
     assert state.failure_streak == hb.MAX_FAILURE_STREAK - 1
     assert not state.aborted
+
+
+def many_chat_db(tmp_path: Path, count: int) -> Path:
+    path = tmp_path / "many.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(SCHEMA)
+        conn.executemany("INSERT INTO chats VALUES (?, ?, NULL)",
+                         [(f"{n:03d}@s.whatsapp.net", f"Chat {n}") for n in range(count)])
+        conn.commit()
+    finally:
+        conn.close()
+    insert_messages(path, [(f"m{n}", f"{n:03d}@s.whatsapp.net", "2026-11-05 08:00:00+00:00") for n in range(count)])
+    return path
+
+
+def test_consecutive_chat_not_in_answer_stops_the_run_at_the_cap(tmp_path: Path) -> None:
+    config = make_config(many_chat_db(tmp_path, hb.MAX_CHAT_NOT_IN_ANSWER_STREAK + 5), tmp_path)
+    bridge = FakeBridge({}, default=chat_not_in_answer())
+    outcome = run(config, bridge)
+    assert outcome.aborted
+    assert outcome.exit_code == 1
+    assert len(outcome.results) == hb.MAX_CHAT_NOT_IN_ANSWER_STREAK
+    assert len(bridge.calls) == hb.MAX_CHAT_NOT_IN_ANSWER_STREAK
+    report = (config.out / "report.md").read_text()
+    assert hb.NOT_IN_ANSWER_ABORT_REASON in report
+    assert "remaining chats were not processed" in report
+    assert "consecutive failures" not in report
+
+
+def test_chat_not_in_answer_streak_is_reset_by_a_processed_answer(tmp_path: Path) -> None:
+    cap = hb.MAX_CHAT_NOT_IN_ANSWER_STREAK
+    config = make_config(many_chat_db(tmp_path, cap + 3), tmp_path)
+    jids = [c.jid for c in hb.select_chats(config)]
+    script = {jid: [chat_not_in_answer()] for jid in jids}
+    script[jids[cap - 1]] = [ok(0, None, None)]  # a processed answer in the middle resets the streak
+    outcome = run(config, FakeBridge(script))
+    assert not outcome.aborted
+    assert len(outcome.results) == len(jids)
+
+
+@pytest.mark.parametrize("breaker", [(404, {"message": "no anchor"}), (500, {"message": "boom"}), ok(0, None, None)],
+                         ids=["404", "failure", "processed"])
+def test_any_other_chat_outcome_breaks_the_not_in_answer_run(tmp_path: Path, breaker: Response) -> None:
+    cap = hb.MAX_CHAT_NOT_IN_ANSWER_STREAK
+    config = make_config(many_chat_db(tmp_path, cap + 1), tmp_path)
+    jids = [c.jid for c in hb.select_chats(config)]
+    script = {jid: [chat_not_in_answer()] for jid in jids}
+    script[jids[cap - 1]] = [breaker]  # cap - 1 chat_not_in_answer chats, one breaker, then one more
+    outcome = run(config, FakeBridge(script))
+    assert not outcome.aborted
+    assert len(outcome.results) == len(jids)
+
+
+def test_abort_on_the_last_chat_does_not_claim_remaining_chats(tmp_path: Path) -> None:
+    config = make_config(many_chat_db(tmp_path, hb.MAX_CHAT_NOT_IN_ANSWER_STREAK), tmp_path)
+    outcome = run(config, FakeBridge({}, default=chat_not_in_answer()))
+    assert outcome.aborted
+    report = (config.out / "report.md").read_text()
+    assert "Aborted after" in report
+    assert "remaining chats were not processed" not in report
+
+
+def test_failure_abort_report_still_names_consecutive_failures(db: Path, tmp_path: Path) -> None:
+    config = make_config(db, tmp_path)
+    outcome = run(config, FakeBridge({}, default=(500, {"message": "boom"})))
+    assert outcome.aborted
+    assert f"Aborted after {hb.FAILURE_ABORT_REASON}" in (config.out / "report.md").read_text()
 
 
 def test_chat_not_in_answer_between_failures_does_not_hide_the_streak(db: Path, tmp_path: Path) -> None:
@@ -581,6 +648,7 @@ def test_report_summarises_chats_not_in_answer(db: Path, tmp_path: Path) -> None
     report = (config.out / "report.md").read_text()
     assert "chat not in answer" in report.lower()
     assert "systemic matching problem" in report
+    assert "do not abort the run" not in report
 
 
 def test_page_cap_resumes_from_last_anchor_with_higher_cap(db: Path, tmp_path: Path) -> None:

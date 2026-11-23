@@ -46,6 +46,12 @@ JITTER_MAX_SECONDS: float = 5.0
 DEFAULT_BUDGET: int = 150
 DEFAULT_MAX_PAGES_PER_CHAT: int = 10
 MAX_FAILURE_STREAK: int = 3
+# Consecutive chats answered with 502 chat_not_in_answer before the run stops (a systemic matching problem).
+MAX_CHAT_NOT_IN_ANSWER_STREAK: int = 10
+FAILURE_ABORT_REASON: str = f"{MAX_FAILURE_STREAK} consecutive failures"
+NOT_IN_ANSWER_ABORT_REASON: str = (
+    f"{MAX_CHAT_NOT_IN_ANSWER_STREAK} consecutive chats answered with chat_not_in_answer"
+)
 CHAT_NOT_IN_ANSWER_REASON: str = "chat_not_in_answer"
 # Longest the bridge spends on one request after its anchor lookup: up to 30 s sending
 # the peer request plus up to 60 s waiting for the phone's answer (historySyncSendTimeout
@@ -160,8 +166,12 @@ class RunOutcome:
 class _RunState:
     requests_sent: int = 0
     failure_streak: int = 0
-    aborted: bool = False
+    abort_reason: str = ""
     budget_exhausted: bool = False
+
+    @property
+    def aborted(self) -> bool:
+        return bool(self.abort_reason)
 
 
 PostFn = Callable[[dict[str, object]], tuple[int, Mapping[str, object]]]
@@ -431,8 +441,9 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
         progress.errors.append(message)
         if counts_toward_abort:
             state.failure_streak += 1
-            if state.failure_streak >= MAX_FAILURE_STREAK:
-                state.aborted = True
+            if state.failure_streak >= MAX_FAILURE_STREAK and not state.aborted:
+                state.abort_reason = FAILURE_ABORT_REASON
+                logger.error("aborting after %s", FAILURE_ABORT_REASON)
         return progress.result(chat.jid, stop)
 
     while True:
@@ -455,7 +466,8 @@ def backfill_chat(chat: ChatSnapshot, config: Config, post: PostFn, state: _RunS
             progress.errors.append(_error_text(status, payload))
             return progress.result(chat.jid, StopReason.NO_ANCHOR)
         if status == 502 and payload.get("reason") == CHAT_NOT_IN_ANSWER_REASON:
-            # Recorded per chat but neither a failure nor a success: it does not move the abort streak.
+            # Recorded per chat but neither a failure nor a success: it does not move the failure streak.
+            # Many chats in a row (counted in run_backfill) point to a systemic matching problem.
             return fail(_error_text(status, payload), StopReason.CHAT_NOT_IN_ANSWER, counts_toward_abort=False)
         if status != 200:
             return fail(_error_text(status, payload))
@@ -624,7 +636,7 @@ def _cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def render_markdown(rows: Sequence[ReportRow], since: datetime, aborted: bool, budget_exhausted: bool,
+def render_markdown(rows: Sequence[ReportRow], since: datetime, abort_reason: str, budget_exhausted: bool,
                     budget: int, unmatched: Sequence[str] = ()) -> str:
     processed = [r for r in rows if r.result is not None]
     missing = _not_covered(rows)
@@ -642,11 +654,13 @@ def render_markdown(rows: Sequence[ReportRow], since: datetime, aborted: bool, b
     not_in_answer = sum(1 for r in processed if r.result is not None and r.result.stop is StopReason.CHAT_NOT_IN_ANSWER)
     if not_in_answer:
         lines.append(f"- Chats whose answer held no conversation for them (\"chat not in answer\"): {not_in_answer}; "
-                     "these do not abort the run, but many of them point to a systemic matching problem")
+                     f"they do not count as failures, but {MAX_CHAT_NOT_IN_ANSWER_STREAK} in a row stop the run "
+                     "because many of them point to a systemic matching problem")
     if unmatched:
         lines.append(f"- Selected chats with no stored message in the window: {', '.join(unmatched)}")
-    if aborted:
-        lines.append(f"- Aborted after {MAX_FAILURE_STREAK} consecutive failures; remaining chats were not processed")
+    if abort_reason:
+        remaining = any(r.result is None for r in rows)
+        lines.append(f"- Aborted after {abort_reason}" + ("; remaining chats were not processed" if remaining else ""))
     if budget_exhausted:
         lines.append(f"- Stopped: request budget of {budget} exhausted; rerun with the same progress file to continue")
     lines += [
@@ -709,6 +723,7 @@ def run_backfill(config: Config, post: PostFn, sleep: SleepFn, jitter: JitterFn)
 
     state = _RunState()
     pacer = _Pacer(config.delay, sleep, jitter)
+    not_in_answer_streak = 0
     for chat in chats:
         previous = progress.results.get(chat.jid)
         if previous is not None and previous.stop in COMPLETE_REASONS:
@@ -718,13 +733,22 @@ def run_backfill(config: Config, post: PostFn, sleep: SleepFn, jitter: JitterFn)
             state.budget_exhausted = True
         if state.aborted or state.budget_exhausted:
             break
-        progress.results[chat.jid] = backfill_chat(chat, config, post, state, pacer, previous)
+        result = backfill_chat(chat, config, post, state, pacer, previous)
+        progress.results[chat.jid] = result
         _save_progress(config.progress, progress)
+        if result.stop is StopReason.CHAT_NOT_IN_ANSWER:
+            not_in_answer_streak += 1
+            if not_in_answer_streak >= MAX_CHAT_NOT_IN_ANSWER_STREAK and not state.aborted:
+                state.abort_reason = NOT_IN_ANSWER_ABORT_REASON
+                logger.error("aborting after %s", NOT_IN_ANSWER_ABORT_REASON)
+        else:
+            # Any other chat outcome (processed answer, 404, failure, no progress, ...) breaks the run of chats.
+            not_in_answer_streak = 0
 
     after = snapshot_window(config.db, config.since, [c.jid for c in chats])
     rows = build_report_rows(chats, progress.before, after, progress.results)
     (config.out / "report.md").write_text(
-        render_markdown(rows, config.since, state.aborted, state.budget_exhausted, config.budget,
+        render_markdown(rows, config.since, state.abort_reason, state.budget_exhausted, config.budget,
                         unmatched_only(config, {c.jid: c for c in chats})))
     write_csv(config.out / "report.csv", rows)
     exit_code = 1 if state.aborted or state.budget_exhausted or _not_covered(rows) else 0
