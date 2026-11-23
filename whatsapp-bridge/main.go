@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -786,6 +787,9 @@ type historySender interface {
 	HasDeviceID() bool
 	BuildHistorySyncRequest(lastKnownMessageInfo *types.MessageInfo, count int) *waE2E.Message
 	SendPeerMessage(ctx context.Context, message *waE2E.Message) (whatsmeow.SendResponse, error)
+	// PhoneJIDForLID returns the phone-number JID of a LID, or an empty JID when none is
+	// known.
+	PhoneJIDForLID(ctx context.Context, lid types.JID) (types.JID, error)
 }
 
 // whatsmeowHistorySender adapts *whatsmeow.Client to historySender.
@@ -847,6 +851,12 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeHistoryError(w http.ResponseWriter, status int, requestID, format string, args ...any) {
 	writeJSON(w, status, historySyncError{Success: false, Message: fmt.Sprintf(format, args...), RequestID: requestID})
+}
+
+// PhoneJIDForLID looks the LID up in the client's LID store; it returns an empty JID
+// when the store has no phone number for it.
+func (s whatsmeowHistorySender) PhoneJIDForLID(ctx context.Context, lid types.JID) (types.JID, error) {
+	return s.Store.LIDs.GetPNForLID(ctx, lid)
 }
 
 // newHistorySyncHandler returns the handler for POST /api/request_history_sync. It
@@ -917,7 +927,25 @@ func newHistorySyncHandler(sender historySender, messageStore *MessageStore, reg
 			return
 		}
 
-		pending, ok := registry.begin(chatJID)
+		// A request for a LID chat names the chat by its phone-number JID when the LID
+		// store knows it; the answer may be keyed by either address.
+		requestChat := jid
+		var answerAliases []string
+		if jid.Server == types.HiddenUserServer {
+			pn, lookupErr := sender.PhoneJIDForLID(r.Context(), jid)
+			switch {
+			case lookupErr != nil:
+				fmt.Printf("LID lookup for %s failed, requesting by LID: %v\n", chatJID, lookupErr)
+			case pn.IsEmpty():
+				fmt.Printf("No phone-number JID known for %s, requesting by LID\n", chatJID)
+			default:
+				requestChat = pn.ToNonAD()
+				answerAliases = append(answerAliases, requestChat.String())
+				fmt.Printf("Requesting history for %s by its phone-number JID\n", chatJID)
+			}
+		}
+
+		pending, ok := registry.begin(chatJID, answerAliases...)
 		if !ok {
 			writeHistoryError(w, http.StatusConflict, "", "another history request is already in flight")
 			return
@@ -925,7 +953,7 @@ func newHistorySyncHandler(sender historySender, messageStore *MessageStore, reg
 		defer registry.finish(pending)
 
 		info := &types.MessageInfo{
-			MessageSource: types.MessageSource{Chat: jid, IsFromMe: anchor.IsFromMe},
+			MessageSource: types.MessageSource{Chat: requestChat, IsFromMe: anchor.IsFromMe},
 			ID:            anchor.ID,
 			Timestamp:     anchor.Timestamp,
 		}
@@ -1391,7 +1419,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	namer := func(jid types.JID, chatJID string, conversation *waHistorySync.Conversation) string {
 		return GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
 	}
-	results := storeHistorySync(messageStore, historySync, namer, client.Store.ID.User, logger)
+	results := storeHistorySync(messageStore, historySync, namer, client.Store.ID.User, historyRequests.canonicalChat, logger)
 	historyRequests.offer(historySync, results)
 }
 
@@ -1420,7 +1448,8 @@ func historyMessageSender(participant string, isFromMe bool, chat types.JID, own
 // storeHistorySync stores the messages of every conversation in a history sync and
 // returns one result per conversation with a parseable JID, including conversations
 // with no messages. ownUser is the sender recorded for messages sent by this account.
-func storeHistorySync(messageStore *MessageStore, historySync *events.HistorySync, namer chatNamer, ownUser string, logger waLog.Logger) []conversationResult {
+func storeHistorySync(messageStore *MessageStore, historySync *events.HistorySync, namer chatNamer, ownUser string,
+	canonicalChat func(string) string, logger waLog.Logger) []conversationResult {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
 	var results []conversationResult
@@ -1431,7 +1460,7 @@ func storeHistorySync(messageStore *MessageStore, historySync *events.HistorySyn
 			continue
 		}
 
-		chatJID := *conversation.ID
+		chatJID := canonicalChat(*conversation.ID)
 
 		// Try to parse the JID
 		jid, err := types.ParseJID(chatJID)
@@ -1551,6 +1580,7 @@ func storeHistorySync(messageStore *MessageStore, historySync *events.HistorySyn
 // pendingHistoryRequest is the one on-demand history request waiting for its answer.
 type pendingHistoryRequest struct {
 	chatJID   string
+	aliases   []string           // other JIDs of the same chat whose conversation also answers it
 	requestID string             // id of the sent request message; "" while sending
 	done      chan historyAnswer // buffered; receives the matching answer once
 	// early holds ON_DEMAND answers that carried an original message id and arrived
@@ -1569,15 +1599,16 @@ type historyRequestRegistry struct {
 // historyRequests is the registry shared by the REST handler and the event handler.
 var historyRequests = &historyRequestRegistry{}
 
-// begin registers a new pending request for chatJID. ok is false when another
+// begin registers a new pending request for chatJID; a conversation for any of aliases
+// (the same chat under another address) is stored under chatJID and answers it. ok is false when another
 // request is already pending.
-func (r *historyRequestRegistry) begin(chatJID string) (p *pendingHistoryRequest, ok bool) {
+func (r *historyRequestRegistry) begin(chatJID string, aliases ...string) (p *pendingHistoryRequest, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.pending != nil {
 		return nil, false
 	}
-	r.pending = &pendingHistoryRequest{chatJID: chatJID, done: make(chan historyAnswer, 1), early: map[string]historyAnswer{}}
+	r.pending = &pendingHistoryRequest{chatJID: chatJID, aliases: aliases, done: make(chan historyAnswer, 1), early: map[string]historyAnswer{}}
 	return r.pending, true
 }
 
@@ -1591,6 +1622,18 @@ func (r *historyRequestRegistry) setRequestID(p *pendingHistoryRequest, requestI
 		p.done <- answer
 		r.pending = nil
 	}
+}
+
+// canonicalChat returns the chat a history-sync conversation is stored under: the
+// pending request's chat when jid is one of its aliases (a LID chat answered under its
+// phone-number JID), else jid itself.
+func (r *historyRequestRegistry) canonicalChat(jid string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pending != nil && slices.Contains(r.pending.aliases, jid) {
+		return r.pending.chatJID
+	}
+	return jid
 }
 
 // finish removes p if it is still the pending request (after a timeout or send failure).

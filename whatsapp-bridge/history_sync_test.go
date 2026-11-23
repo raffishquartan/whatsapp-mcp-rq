@@ -26,7 +26,21 @@ import (
 // storeText stores a plain text message in chat@g.us and returns whether the row already existed.
 func storeText(t *testing.T, store *MessageStore, id string, ts time.Time, fromMe bool) bool {
 	t.Helper()
-	existed, err := store.StoreMessage(id, "chat@g.us", "sender", "text "+id, ts, fromMe,
+	return storeMessageIn(t, store, id, "chat@g.us", ts, fromMe)
+}
+
+// storeTextIn stores a text message in chatJID, creating the chat row first.
+func storeTextIn(t *testing.T, store *MessageStore, id, chatJID string, ts time.Time, fromMe bool) bool {
+	t.Helper()
+	if err := store.StoreChat(chatJID, "chat", ts); err != nil {
+		t.Fatalf("StoreChat(%s): %v", chatJID, err)
+	}
+	return storeMessageIn(t, store, id, chatJID, ts, fromMe)
+}
+
+func storeMessageIn(t *testing.T, store *MessageStore, id, chatJID string, ts time.Time, fromMe bool) bool {
+	t.Helper()
+	existed, err := store.StoreMessage(id, chatJID, "sender", "text "+id, ts, fromMe,
 		"", "", "", nil, nil, nil, 0)
 	if err != nil {
 		t.Fatalf("StoreMessage(%s): %v", id, err)
@@ -179,7 +193,7 @@ func historySyncEvent(syncType waHistorySync.HistorySync_HistorySyncType, origin
 func fixedName(types.JID, string, *waHistorySync.Conversation) string { return "Chat A" }
 
 func storeSync(store *MessageStore, hs *events.HistorySync) []conversationResult {
-	return storeHistorySync(store, hs, fixedName, "own", waLog.Noop)
+	return storeHistorySync(store, hs, fixedName, "own", func(jid string) string { return jid }, waLog.Noop)
 }
 
 func TestStoreHistorySyncReportsPerConversationResults(t *testing.T) {
@@ -345,6 +359,10 @@ type fakeSender struct {
 	// blockSend makes SendPeerMessage wait for its context to end, like a send whose
 	// server acknowledgement never arrives.
 	blockSend bool
+	// pn is what PhoneJIDForLID returns (the zero JID is "no phone number known"), and
+	// lidErr the error it returns instead.
+	pn     types.JID
+	lidErr error
 
 	mu     sync.Mutex
 	sent   []*waE2E.Message
@@ -357,6 +375,10 @@ func newFakeSender() *fakeSender {
 
 func (f *fakeSender) IsConnected() bool { return f.connected }
 func (f *fakeSender) HasDeviceID() bool { return f.loggedIn }
+
+func (f *fakeSender) PhoneJIDForLID(ctx context.Context, lid types.JID) (types.JID, error) {
+	return f.pn, f.lidErr
+}
 
 // BuildHistorySyncRequest uses whatsmeow's real builder, which reads no client state.
 func (f *fakeSender) BuildHistorySyncRequest(info *types.MessageInfo, count int) *waE2E.Message {
@@ -431,7 +453,7 @@ func (f *historyFixture) doAsync(body string) <-chan *httptest.ResponseRecorder 
 
 // answer delivers a history sync through the same path handleHistorySync uses.
 func (f *historyFixture) answer(hs *events.HistorySync) {
-	f.reg.offer(hs, storeSync(f.store, hs))
+	f.reg.offer(hs, storeHistorySync(f.store, hs, fixedName, "own", f.reg.canonicalChat, waLog.Noop))
 }
 
 func waitResponse(t *testing.T, ch <-chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
@@ -907,5 +929,89 @@ func TestHistoryEndpointClientGoneAway(t *testing.T) {
 	expectError(t, waitResponse(t, ch), http.StatusGatewayTimeout, "client went away")
 	if _, ok := f.reg.begin("chat@g.us"); !ok {
 		t.Error("registry still busy after the client went away")
+	}
+}
+
+func TestHistoryEndpointLIDChatRequestedByPhoneNumberJID(t *testing.T) {
+	f := newHistoryFixture(t, 5*time.Second)
+	f.sender.pn = types.NewJID("447700900123", types.DefaultUserServer).ToNonAD()
+	f.sender.pn.Device = 2 // GetPNForLID can carry a device; conversation IDs never do
+	storeTextIn(t, f.store, "lid-anchor", "123456789@lid", time.Unix(1700000200, 0), false)
+
+	pending := f.doAsync(`{"chat_jid":"123456789@lid"}`)
+	req := onDemandRequest(t, f.sender.waitSent(t))
+	if req.GetChatJID() != "447700900123@s.whatsapp.net" || req.GetOldestMsgID() != "lid-anchor" {
+		t.Errorf("request = %v, want the device-less phone-number JID anchored on the LID chat's oldest message", req)
+	}
+	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ1",
+		conversation("447700900123@s.whatsapp.net", historyMsg("h2", 1700000150, false, textMsg("two")),
+			historyMsg("h1", 1700000100, false, textMsg("one")))))
+	rec := waitResponse(t, pending)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeBody(t, rec)
+	if body["next_before_message_id"] != "h1" || body["stored_new"] != 2.0 {
+		t.Errorf("body = %v, want 2 new messages and next_before_message_id h1", body)
+	}
+	// The answer is stored under the requested LID chat, so the next page can anchor on it.
+	if _, err := f.store.MessageByID("h1", "123456789@lid"); err != nil {
+		t.Errorf("answer not stored under the LID chat: %v", err)
+	}
+	if _, err := f.store.MessageByID("h1", "447700900123@s.whatsapp.net"); err == nil {
+		t.Error("answer was also stored under the phone-number chat")
+	}
+
+	f.sender.respID = "REQ2"
+	page2 := f.doAsync(`{"chat_jid":"123456789@lid","before_message_id":"h1"}`)
+	if req2 := onDemandRequest(t, f.sender.waitSent(t)); req2.GetOldestMsgID() != "h1" {
+		t.Errorf("second request anchor = %q, want h1", req2.GetOldestMsgID())
+	}
+	f.answer(historySyncEvent(waHistorySync.HistorySync_ON_DEMAND, "REQ2",
+		conversation("447700900123@s.whatsapp.net", historyMsg("h0", 1700000050, false, textMsg("zero")))))
+	if rec := waitResponse(t, page2); rec.Code != http.StatusOK {
+		t.Fatalf("second page status = %d, body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHistoryEndpointLIDChatFallsBackToLID(t *testing.T) {
+	cases := map[string]func(*fakeSender){
+		"no phone number known": func(s *fakeSender) {},
+		"lookup error":          func(s *fakeSender) { s.lidErr = errors.New("store down") },
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newHistoryFixture(t, 50*time.Millisecond)
+			setup(f.sender)
+			storeTextIn(t, f.store, "lid-anchor", "123456789@lid", time.Unix(1700000200, 0), false)
+
+			pending := f.doAsync(`{"chat_jid":"123456789@lid"}`)
+			req := onDemandRequest(t, f.sender.waitSent(t))
+			if req.GetChatJID() != "123456789@lid" {
+				t.Errorf("request chat = %q, want the LID", req.GetChatJID())
+			}
+			waitResponse(t, pending)
+		})
+	}
+}
+
+func TestRegistryCanonicalChatMapsAliasOnlyWhilePending(t *testing.T) {
+	reg := &historyRequestRegistry{}
+	if got := reg.canonicalChat("447700900123@s.whatsapp.net"); got != "447700900123@s.whatsapp.net" {
+		t.Errorf("without a pending request canonicalChat = %q, want the input", got)
+	}
+	p, ok := reg.begin("123456789@lid", "447700900123@s.whatsapp.net")
+	if !ok {
+		t.Fatal("begin failed")
+	}
+	if got := reg.canonicalChat("447700900123@s.whatsapp.net"); got != "123456789@lid" {
+		t.Errorf("alias canonicalChat = %q, want the LID", got)
+	}
+	if got := reg.canonicalChat("other@g.us"); got != "other@g.us" {
+		t.Errorf("unrelated canonicalChat = %q, want the input", got)
+	}
+	reg.finish(p)
+	if got := reg.canonicalChat("447700900123@s.whatsapp.net"); got != "447700900123@s.whatsapp.net" {
+		t.Errorf("after finish canonicalChat = %q, want the input", got)
 	}
 }

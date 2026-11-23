@@ -61,8 +61,12 @@ The endpoint SHALL report bridge state and send failures as structured errors an
 - **WHEN** sending the peer message has not completed within the send timeout (30 seconds)
 - **THEN** the bridge abandons the send and responds 502 with the error text, so one request takes at most 90 seconds (30-second send plus 60-second wait) after the anchor lookup
 
+#### Scenario: LID chat requested by its phone-number JID
+- **WHEN** `chat_jid` is a `@lid` JID and the client's LID store maps it to a phone-number JID
+- **THEN** the request names the chat by that JID without a device part, anchored on the stored message of the LID chat; a conversation under that JID is stored under `chat_jid`, completes the request, and the response's `next_before_message_id` names a stored message of `chat_jid`; with no mapping, or a lookup error, the request names the LID
+
 #### Scenario: Answer without the requested chat
-- **WHEN** the on-demand history sync that matches the request id holds no conversation for `chat_jid` (for example the phone answered under another JID for the chat)
+- **WHEN** the on-demand history sync that matches the request id holds no conversation for `chat_jid` (for example the phone answered under a JID other than the chat's or, for a `@lid` chat, its mapped phone-number JID)
 - **THEN** the bridge stores what the answer holds and responds 502 with `reason: "chat_not_in_answer"`, the `request_id`, and a `conversations` JSON array of the conversation JIDs the answer held (empty when it held none); it does not report the start of the chat
 
 #### Scenario: Late answer to an earlier request
